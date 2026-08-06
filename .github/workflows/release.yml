@@ -1,0 +1,127 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --all-extras --group dev
+      - name: Validate tag matches package version
+        run: |
+          package_version="$(uv run python -c 'from importlib.metadata import version; print(version("daft-olap-connectors"))')"
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+      - name: Scan repository for credentials
+        uses: trufflesecurity/trufflehog@v3.95.2
+        with:
+          path: ./
+          base: ""
+          head: ${{ github.ref_name }}
+          extra_args: --results=verified,unknown
+      - run: uv run python -m build
+      - run: uvx twine check dist/*
+      - name: Generate distribution SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: dist/
+          format: spdx-json
+          output-file: daft-olap-connectors-sbom.spdx.json
+          artifact-name: sbom
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: daft-olap-connectors-sbom.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  install-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        install:
+          - daft-olap-connectors
+          - daft-olap-connectors[clickhouse]
+          - daft-olap-connectors[doris]
+          - daft-olap-connectors[doris-flight]
+          - daft-olap-connectors[ray]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - name: Install built distribution
+        run: python -m pip install --find-links dist/ "${{ matrix.install }}==${GITHUB_REF_NAME#v}"
+      - name: Import public package
+        run: >-
+          python -c 'from importlib.metadata import version; import daft_olap;
+          assert daft_olap.__version__ == version("daft-olap-connectors")'
+
+  publish:
+    needs: [build, install-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" dist/* sbom/*
+          --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"

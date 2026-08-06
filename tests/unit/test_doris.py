@@ -1,0 +1,243 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import pickle
+from typing import Any, cast
+
+import daft
+import pyarrow as pa
+import pytest
+from daft.expressions import Expression
+from daft.io.pushdowns import Pushdowns
+
+from daft_olap._common.errors import (
+    AuthenticationError,
+    CompatibilityError,
+    ConfigurationError,
+    DatabasePermissionError,
+    DiscoveryError,
+    SchemaError,
+)
+from daft_olap._common.identifiers import QualifiedTable
+from daft_olap._common.predicate_ir import Column, Compare, Literal
+from daft_olap.doris.datasource import DorisDataSource
+from daft_olap.doris.discovery import parse_query_plan_response
+from daft_olap.doris.schema import canonical_schema, doris_type_to_arrow, parse_describe_rows
+from daft_olap.doris.sql import DorisParameterStyle, build_select
+from daft_olap.doris.task import DorisTask, DorisTransport
+
+SCHEMA = pa.schema(
+    [
+        pa.field("id", pa.int64(), nullable=False),
+        pa.field("kind", pa.string()),
+        pa.field("score", pa.int32()),
+    ]
+)
+
+
+def _greater_than_or_equal(column: str, value: object) -> Expression:
+    return cast(Expression, cast(Any, daft.col(column)) >= value)
+
+
+def _unsupported_length_filter(column: str, value: int) -> Expression:
+    return cast(Expression, cast(Any, daft.functions.length(daft.col(column))) > value)
+
+
+def test_doris_schema_mapping_preserves_width_nullability_and_decimal_bounds() -> None:
+    columns = parse_describe_rows(
+        [
+            ("id", "BIGINT", "NO"),
+            ("amount", "DECIMALV3(20, 6)", "YES"),
+            ("created", "DATETIMEV2(6)", "YES"),
+        ]
+    )
+    schema = canonical_schema(columns)
+    assert schema.field("id") == pa.field("id", pa.int64(), nullable=False)
+    assert schema.field("amount").type == pa.decimal128(20, 6)
+    assert schema.field("created").type == pa.timestamp("us")
+    with pytest.raises(SchemaError, match="unsupported"):
+        doris_type_to_arrow("ARRAY<INT>", column_name="items")
+
+
+def test_doris_query_plan_parser_uses_only_unique_positive_tablets() -> None:
+    payload = {
+        "code": 0,
+        "data": {
+            "status": 200,
+            "partitions": {"9": {"routings": []}, "3": {"routings": []}},
+            "opaqued_query_plan": "must-not-be-used",
+        },
+    }
+    assert parse_query_plan_response(payload) == (3, 9)
+    with pytest.raises(DiscoveryError, match="duplicate"):
+        parse_query_plan_response(
+            {"code": 0, "data": {"status": 200, "partitions": {"01": {}, "1": {}}}}
+        )
+    with pytest.raises(AuthenticationError):
+        parse_query_plan_response({"code": 401})
+    with pytest.raises(DatabasePermissionError):
+        parse_query_plan_response(
+            {
+                "code": 0,
+                "data": {"status": "1", "exception": "Access denied for user"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("style", "expected_sql", "expected_parameters"),
+    [
+        (
+            "mysql",
+            "SELECT `id` FROM `analytics`.`events` TABLET(3, 9) "
+            "WHERE (`kind` = %s AND note = ':literal') AND (`score` >= %s) LIMIT 4",
+            ("alpha", 10),
+        ),
+        (
+            "flight",
+            "SELECT `id` FROM `analytics`.`events` TABLET(3, 9) "
+            "WHERE (`kind` = from_base64('YWxwaGE=') AND note = ':literal') "
+            "AND (`score` >= 10) LIMIT 4",
+            (),
+        ),
+    ],
+)
+def test_doris_select_golden_sql_uses_neutral_named_raw_parameters(
+    style: DorisParameterStyle,
+    expected_sql: str,
+    expected_parameters: tuple[object, ...],
+) -> None:
+    sql, parameters = build_select(
+        table=QualifiedTable("analytics", "events"),
+        columns=("id",),
+        style=style,
+        predicate=Compare(">=", Column("score"), Literal(10)),
+        unsafe_where_sql="`kind` = :kind AND note = ':literal'",
+        query_parameters=(("kind", "alpha"),),
+        tablet_ids=(3, 9),
+        limit=4,
+    )
+    assert sql == expected_sql
+    assert parameters == expected_parameters
+
+
+def test_doris_unsafe_parameters_must_be_exactly_consumed() -> None:
+    with pytest.raises(ConfigurationError, match="unused"):
+        build_select(
+            table=QualifiedTable("db", "table"),
+            columns=("id",),
+            style="mysql",
+            predicate=None,
+            unsafe_where_sql="id > 0",
+            query_parameters=(("unused", 1),),
+            tablet_ids=None,
+            limit=None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["mysql", "flight"])
+async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
+    transport: DorisTransport,
+) -> None:
+    planning_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def discover(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+        planning_calls.append((sql, parameters))
+        return (4, 2, 3, 1)
+
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport=transport,
+        password="secret-value",
+        target_tasks=2,
+        max_tasks=2,
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=discover,
+    )
+    tasks = [
+        task
+        async for task in source.get_tasks(
+            Pushdowns(filters=_greater_than_or_equal("score", 10), columns=["kind"], limit=5)
+        )
+    ]
+    assert len(tasks) == 2
+    assert all(isinstance(task, DorisTask) for task in tasks)
+    doris_tasks = [cast(DorisTask, task) for task in tasks]
+    assert all(task._transport == transport for task in doris_tasks)
+    assert all(task.schema.column_names() == ["kind", "score"] for task in doris_tasks)
+    assert planning_calls[0][0].count("TABLET") == 0
+    assert "%s" in planning_calls[0][0]
+    assert "secret-value" not in repr(source)
+    pickle.loads(pickle.dumps(tasks[0]))
+
+
+@pytest.mark.asyncio
+async def test_doris_limit_stays_in_daft_when_filter_is_residual() -> None:
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="mysql",
+        split="single",
+        _arrow_schema=SCHEMA,
+    )
+    tasks = [
+        cast(DorisTask, task)
+        async for task in source.get_tasks(
+            Pushdowns(
+                filters=_unsupported_length_filter("kind", 2),
+                columns=["id"],
+                limit=3,
+            )
+        )
+    ]
+    assert len(tasks) == 1
+    assert "LIMIT" not in tasks[0]._query.sql
+    assert tasks[0].schema.column_names() == ["id", "kind"]
+
+    zero_limit_tasks = [
+        cast(DorisTask, task)
+        async for task in source.get_tasks(
+            Pushdowns(filters=_unsupported_length_filter("kind", 2), columns=["id"], limit=0)
+        )
+    ]
+    assert "LIMIT 0" in zero_limit_tasks[0]._query.sql
+
+
+@pytest.mark.asyncio
+async def test_doris_count_honors_negotiated_daft_capability() -> None:
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="flight",
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=lambda sql, parameters: pytest.fail("count must not discover tablets"),
+    )
+    count_pushdowns = Pushdowns(aggregation=daft.col("id").count("all"))
+    if not source.supports_count_pushdown():
+        with pytest.raises(CompatibilityError):
+            _ = [task async for task in source.get_tasks(count_pushdowns)]
+        return
+
+    tasks = [task async for task in source.get_tasks(count_pushdowns)]
+    assert len(tasks) == 1
+    count_task = cast(DorisTask, tasks[0])
+    assert count_task._transport == "flight"
+    assert "count(*) AS `id`" in count_task._query.sql
+    with pytest.raises(CompatibilityError):
+        _ = [task async for task in source.get_tasks(Pushdowns(aggregation=daft.col("id").sum()))]

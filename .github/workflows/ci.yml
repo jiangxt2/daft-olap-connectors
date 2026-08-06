@@ -1,0 +1,148 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: Static and package checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --all-extras --group dev
+      - run: uv run ruff check src tests scripts benchmarks
+      - run: uv run ruff format --check src tests scripts benchmarks
+      - run: uv run mypy src tests/unit tests/contract
+      - run: uv run python scripts/check_license_headers.py
+      - run: uv run codespell
+      - run: uv run mkdocs build --strict
+      - run: uv run python -m build
+
+  dco:
+    name: DCO trailers
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv run --no-project python scripts/check_dco.py "origin/${{ github.base_ref }}" HEAD
+
+  contract:
+    name: ${{ matrix.profile }} / Python ${{ matrix.python }} / Daft ${{ matrix.daft }} / Ray ${{ matrix.ray }} / PyArrow ${{ matrix.pyarrow }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: minimum-pyarrow
+            python: "3.12"
+            daft: "0.7.23"
+            pyarrow: "16.1.0"
+            ray: "2.55.1"
+            ray_requirement: "ray==2.55.1"
+          - profile: tributo
+            python: "3.12"
+            daft: "0.7.23"
+            pyarrow: "19.0.1"
+            ray: "2.55.1"
+            ray_requirement: "ray[default,serve,tune]==2.55.1"
+          - profile: tributo
+            python: "3.13"
+            daft: "0.7.23"
+            pyarrow: "19.0.1"
+            ray: "2.55.1"
+            ray_requirement: "ray[default,serve,tune]==2.55.1"
+          - profile: upper-pyarrow
+            python: "3.13"
+            daft: "0.7.23"
+            pyarrow: "24.0.0"
+            ray: "2.55.1"
+            ray_requirement: "ray==2.55.1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked --all-extras --group dev
+      - run: >-
+          uv pip install
+          "daft[ray]==${{ matrix.daft }}"
+          "${{ matrix.ray_requirement }}"
+          "pyarrow==${{ matrix.pyarrow }}"
+      - run: >-
+          uv run --no-sync pytest -p no:cacheprovider tests/unit tests/contract
+          -m "not ray" --cov=daft_olap --cov-branch --cov-report=term-missing
+      - run: uv run --no-sync pytest -p no:cacheprovider tests/contract -m ray -vv
+
+  clickhouse-it:
+    name: ClickHouse 25.3.2.39 IT
+    needs: [static, contract]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --all-extras --group dev
+      - run: ./scripts/run_clickhouse_it.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clickhouse-it-logs
+          path: .artifacts/it
+          if-no-files-found: ignore
+
+  doris-it:
+    name: Doris 4.0.6 IT
+    needs: [static, contract]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --all-extras --group dev
+      - run: ./scripts/run_doris_it.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: doris-it-logs
+          path: .artifacts/it
+          if-no-files-found: ignore

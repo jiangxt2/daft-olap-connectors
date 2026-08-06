@@ -1,0 +1,54 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Daft main canary
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daft-main-canary
+  cancel-in-progress: true
+
+jobs:
+  daft-main:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2025-09-03
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Daft Rust toolchain
+        run: rustup toolchain install "${RUSTUP_TOOLCHAIN}" --profile minimal
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --locked --all-extras --group dev
+      - name: Resolve current Daft main
+        id: daft-main
+        run: |
+          daft_sha="$(git ls-remote https://github.com/Eventual-Inc/Daft.git refs/heads/main | awk '{print $1}')"
+          test -n "${daft_sha}"
+          echo "sha=${daft_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Testing Daft main at ${daft_sha}"
+      - name: Install current Daft main canary
+        run: >-
+          uv pip install
+          "daft @ git+https://github.com/Eventual-Inc/Daft.git@${{ steps.daft-main.outputs.sha }}"
+      - run: uv run --no-sync pytest -p no:cacheprovider tests/unit tests/contract -vv
