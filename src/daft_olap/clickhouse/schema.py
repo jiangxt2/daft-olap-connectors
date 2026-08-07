@@ -58,7 +58,7 @@ _MAX_DECIMAL_PRECISION = 38
 _MAX_DATETIME64_PRECISION = 9
 _MIN_DESCRIBE_COLUMNS = 2
 _TEXT_TRANSPORT_TYPES = {"Enum8", "Enum16", "IPv4", "IPv6", "UUID"}
-_TUPLE_FIELD = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*|`(?:[^`\\]|\\.)+`)\s+(?P<type>.+)$")
+_TUPLE_FIELD = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*|`(?:[^`\\]|\\.|``)+`)\s+(?P<type>.+)$")
 _TIME_ZONE = re.compile(r"^'[A-Za-z0-9_+./:-]+'$")
 
 
@@ -177,6 +177,13 @@ def _validate_single_integer_type(parsed: ClickHouseType, value: str) -> None:
         raise SchemaError(f"invalid ClickHouse {parsed.name} scale: {value!r}")
 
 
+def _tuple_field(argument: str) -> tuple[str, str] | None:
+    match = _TUPLE_FIELD.fullmatch(argument)
+    if match is None:
+        return None
+    return match.group("name"), match.group("type")
+
+
 def _validate_type_expression(value: str) -> None:
     parsed = parse_clickhouse_type(value)
     if parsed.name in _SIMPLE_TYPES:
@@ -201,10 +208,10 @@ def _validate_type_expression(value: str) -> None:
             try:
                 _validate_type_expression(argument)
             except SchemaError:
-                named_parts = argument.split(maxsplit=1)
-                if len(named_parts) != _BINARY_TYPE_ARGUMENTS:
+                named_field = _tuple_field(argument)
+                if named_field is None:
                     raise
-                _validate_type_expression(named_parts[1])
+                _validate_type_expression(named_field[1])
         return
     if parsed.name == "Decimal256":
         raise SchemaError(f"unsupported ClickHouse type: {value!r}")
@@ -271,11 +278,12 @@ def _transport_type_expression(value: str) -> str:
             try:
                 tuple_arguments.append(_transport_type_expression(argument))
             except SchemaError:
-                match = _TUPLE_FIELD.fullmatch(argument)
-                if match is None:
+                named_field = _tuple_field(argument)
+                if named_field is None:
                     raise
-                field_type = _transport_type_expression(match.group("type"))
-                tuple_arguments.append(f"{match.group('name')} {field_type}")
+                field_name, declared_type = named_field
+                field_type = _transport_type_expression(declared_type)
+                tuple_arguments.append(f"{field_name} {field_type}")
         return f"Tuple({', '.join(tuple_arguments)})"
     if parsed.name == "DateTime":
         if not parsed.arguments:

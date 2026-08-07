@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import pickle
+from datetime import UTC, datetime, time
 from importlib.metadata import version
 from typing import Any, cast
 
@@ -49,6 +50,7 @@ def test_public_error_hierarchy_is_exported_from_the_stable_facade() -> None:
         "AuthenticationError",
         "CompatibilityError",
         "ConfigurationError",
+        "DatabaseObjectNotFoundError",
         "DatabasePermissionError",
         "DependencyError",
         "DiscoveryError",
@@ -116,6 +118,30 @@ def test_freeze_options_copies_and_rejects_reserved_keys() -> None:
 def test_query_spec_rejects_mixed_parameter_styles() -> None:
     with pytest.raises(ConfigurationError, match="mix"):
         QuerySpec(sql="SELECT 1", positional_parameters=(1,), named_parameters=(("x", 1),))
+
+
+def test_query_spec_repr_and_temporal_validation_are_credential_safe() -> None:
+    secret = "bound-secret-value"
+    query = QuerySpec(
+        sql=f"SELECT '{secret}'",
+        named_parameters=(("api_key", secret),),
+        arrow_schema=pa.schema([("id", pa.int64())]),
+    )
+    rendered = repr(query)
+    assert secret not in rendered
+    assert "SELECT" not in rendered
+    assert "api_key" in rendered
+    assert "positional_parameter_count=0" in rendered
+    assert repr(pickle.loads(pickle.dumps(query))) == rendered
+
+    aware_values = (
+        datetime(2026, 1, 1, tzinfo=UTC),
+        time(12, 0, tzinfo=UTC),
+        {"nested": [datetime(2026, 1, 1, tzinfo=UTC)]},
+    )
+    for value in aware_values:
+        with pytest.raises(ConfigurationError, match="timezone-aware"):
+            QuerySpec(sql="SELECT 1", positional_parameters=(value,))
 
 
 def test_grouping_algorithms_are_deterministic_and_bounded() -> None:

@@ -14,8 +14,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, time
 from typing import Any, Literal
 
 import pyarrow as pa
@@ -47,6 +48,35 @@ def freeze_options(
             raise ConfigurationError(f"{option_name} must not override managed option {key!r}")
         frozen.append((key, value))
     return tuple(sorted(frozen, key=lambda item: item[0]))
+
+
+def validate_query_parameter_values(values: Iterable[Any]) -> None:
+    """Reject timezone-aware temporal values anywhere in a query parameter container."""
+    visited: set[int] = set()
+
+    def validate(value: Any) -> None:
+        if isinstance(value, (datetime, time)) and value.tzinfo is not None:
+            raise ConfigurationError(
+                "timezone-aware datetime and time query parameters are not supported"
+            )
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in visited:
+                return
+            visited.add(identity)
+            for nested in value.values():
+                validate(nested)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            identity = id(value)
+            if identity in visited:
+                return
+            visited.add(identity)
+            for nested in value:
+                validate(nested)
+
+    for item in values:
+        validate(item)
 
 
 @dataclass(frozen=True)
@@ -124,7 +154,7 @@ def iter_batch_slices(
         offset += size
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class QuerySpec:
     """A picklable SQL statement, bound values, and canonical Arrow result schema."""
 
@@ -138,10 +168,23 @@ class QuerySpec:
             raise ConfigurationError("query SQL must not be empty")
         if self.positional_parameters and self.named_parameters:
             raise ConfigurationError("a query cannot mix positional and named parameters")
+        validate_query_parameter_values(iter(self.positional_parameters))
+        validate_query_parameter_values(iter(value for _, value in self.named_parameters))
 
     def named_parameter_dict(self) -> dict[str, Any]:
         """Return a fresh parameter mapping for a database driver."""
         return dict(self.named_parameters)
+
+    def __repr__(self) -> str:
+        """Describe query shape without exposing SQL or bound values."""
+        parameter_names = tuple(name for name, _ in self.named_parameters)
+        return (
+            "QuerySpec("
+            "sql=<redacted>, "
+            f"positional_parameter_count={len(self.positional_parameters)}, "
+            f"named_parameter_names={parameter_names!r}, "
+            f"arrow_schema={self.arrow_schema!r})"
+        )
 
 
 def group_weighted_items(

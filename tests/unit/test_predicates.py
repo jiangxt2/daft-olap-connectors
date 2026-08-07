@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import operator
+from datetime import UTC, datetime, time
 from decimal import Decimal
 from typing import Any, cast
 
@@ -101,6 +102,15 @@ def test_non_finite_float_literals_leave_the_complete_predicate_in_daft(value: o
 def test_non_finite_decimal_literals_are_rejected_at_the_ir_boundary() -> None:
     with pytest.raises(UnsupportedPredicateError, match="non-finite decimal"):
         Literal(Decimal("NaN"))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [datetime(2026, 1, 1, tzinfo=UTC), time(12, 0, tzinfo=UTC)],
+)
+def test_timezone_aware_temporal_literals_fail_closed(value: object) -> None:
+    with pytest.raises(UnsupportedPredicateError, match="timezone-aware"):
+        Literal(cast(Any, value))
 
 
 def test_any_unsupported_subtree_disables_the_whole_pushdown() -> None:

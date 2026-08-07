@@ -60,6 +60,14 @@ unknown engines, and unavailable metadata use one task. For `split="auto"`, the 
 must pin planning and task queries to the same physical server; use `split="single"` behind an
 uncontrolled replica or shard load balancer.
 
+A physical user column named `_partition_id` shadows ClickHouse's virtual column. The connector
+checks both the discovered schema and `system.columns` and disables automatic splitting for such a
+table, so user data cannot be silently filtered by physical partition identifiers.
+
+`max_block_size` and `max_execution_time` are connector-managed ClickHouse settings derived from
+`batch_rows` and `query_timeout_seconds`. Supplying either key through `settings` raises
+`ConfigurationError` instead of being silently overwritten.
+
 ## Apache Doris
 
 ```python
@@ -99,6 +107,12 @@ markers and a `query_parameters` mapping. MySQL values use PyMySQL binding. Dori
 implement Flight SQL query-parameter binding, so Flight values use the connector's fail-closed typed
 literal renderer: text is Base64 encoded, bytes are hexadecimal, and only finite numeric values are
 accepted. Application string formatting is never used.
+
+Write ordinary SQL percent operators and `LIKE 'prefix%'` patterns with one percent sign. When a
+driver binding path is active, the connector protects literal percent signs before PyMySQL or
+clickhouse-connect performs Python-style formatting. Timezone-aware `datetime` and `time` values
+are rejected rather than silently losing or changing their timezone; normalize them explicitly to
+the database's intended wall-clock convention before creating a filter or query parameter.
 
 ## Resource and consistency boundary
 

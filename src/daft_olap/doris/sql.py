@@ -57,6 +57,15 @@ def _flight_string_literal(value: str) -> str:
     return f"from_base64('{encoded}')"
 
 
+def _render_temporal_literal(value: date | datetime | time) -> str:
+    if isinstance(value, (datetime, time)) and value.tzinfo is not None:
+        raise ConfigurationError(
+            "timezone-aware datetime and time query parameters are not supported"
+        )
+    text = value.isoformat(sep=" ") if isinstance(value, datetime) else str(value)
+    return _flight_string_literal(text)
+
+
 def render_flight_literal(value: object) -> str:
     """Render one value without raw interpolation for Doris Flight SQL."""
     if value is None:
@@ -75,9 +84,9 @@ def render_flight_literal(value: object) -> str:
         rendered = str(value)
     elif isinstance(value, bytes):
         rendered = f"X'{value.hex()}'"
-    elif isinstance(value, datetime):
-        rendered = _flight_string_literal(value.isoformat(sep=" "))
-    elif isinstance(value, (str, date, time, UUID)):
+    elif isinstance(value, (date, time)):
+        rendered = _render_temporal_literal(value)
+    elif isinstance(value, (str, UUID)):
         rendered = _flight_string_literal(str(value))
     else:
         raise ConfigurationError(f"unsupported Doris Flight parameter type: {type(value).__name__}")
@@ -156,6 +165,8 @@ def _render_unsafe_fragment(
     fragment: str,
     query_parameters: tuple[tuple[str, Any], ...],
     style: DorisParameterStyle,
+    *,
+    bind_required: bool,
 ) -> tuple[str, tuple[Any, ...]]:
     """Translate neutral ``:name`` markers outside quotes into driver placeholders."""
     values_by_name = dict(query_parameters)
@@ -165,25 +176,31 @@ def _render_unsafe_fragment(
     values: list[Any] = []
     used: set[str] = set()
     quote: str | None = None
+
+    def append_raw(character: str) -> None:
+        rendered.append(
+            "%%" if character == "%" and style == "mysql" and bind_required else character
+        )
+
     index = 0
     while index < len(fragment):
         character = fragment[index]
         if quote is not None:
-            rendered.append(character)
+            append_raw(character)
             if character == "\\" and quote != "`" and index + 1 < len(fragment):
                 index += 1
-                rendered.append(fragment[index])
+                append_raw(fragment[index])
             elif character == quote:
                 if index + 1 < len(fragment) and fragment[index + 1] == quote:
                     index += 1
-                    rendered.append(fragment[index])
+                    append_raw(fragment[index])
                 else:
                     quote = None
             index += 1
             continue
         if character in {"'", '"', "`"}:
             quote = character
-            rendered.append(character)
+            append_raw(character)
             index += 1
             continue
         marker = _render_parameter_marker(fragment, index, values_by_name, style, values)
@@ -192,8 +209,10 @@ def _render_unsafe_fragment(
             rendered.append(replacement)
             used.add(name)
             continue
-        rendered.append(character)
+        append_raw(character)
         index += 1
+    if quote is not None:
+        raise ConfigurationError("unsafe_where_sql contains an unclosed quoted value")
     unused = set(values_by_name).difference(used)
     if unused:
         raise ConfigurationError(f"unused Doris query parameters: {', '.join(sorted(unused))}")
@@ -228,18 +247,23 @@ def build_select(
         sql += f" TABLET({', '.join(str(value) for value in tablet_ids)})"
     clauses: list[str] = []
     parameters: list[Any] = []
+    rendered_predicate = render_predicate(predicate, style) if predicate is not None else None
+    predicate_parameters = () if rendered_predicate is None else rendered_predicate.parameters
     if unsafe_where_sql is not None:
         rendered_unsafe, unsafe_parameters = _render_unsafe_fragment(
-            unsafe_where_sql, query_parameters, style
+            unsafe_where_sql,
+            query_parameters,
+            style,
+            bind_required=style == "mysql"
+            and (bool(query_parameters) or bool(predicate_parameters)),
         )
         clauses.append(f"({rendered_unsafe})")
         parameters.extend(unsafe_parameters)
     elif query_parameters:
         raise ConfigurationError("query_parameters require unsafe_where_sql")
-    if predicate is not None:
-        rendered = render_predicate(predicate, style)
-        clauses.append(rendered.sql)
-        parameters.extend(rendered.parameters)
+    if rendered_predicate is not None:
+        clauses.append(rendered_predicate.sql)
+        parameters.extend(rendered_predicate.parameters)
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     if limit is not None and count_output_name is None:

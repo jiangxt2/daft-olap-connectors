@@ -22,9 +22,11 @@ ranges are widened.
 The exact lock and fixed integration image tags are the development evidence. Published compatibility
 claims must be narrowed to combinations that have passed unit, native, Ray, and real database tests.
 
-Daft 0.7.23 exposes the public `DataSource.supports_count_pushdown()` capability. The compatibility
-adapter still validates the exact native global-count shape before enabling the connector's
-one-task server count. More complex or unknown aggregation shapes fail closed.
+The public `DataSource.supports_count_pushdown()` capability is present from Daft 0.7.22. This
+project keeps 0.7.23 as its minimum because that is the fully validated connector and Tributo
+combination baseline. The compatibility adapter still validates the exact native global-count
+shape before enabling the connector's one-task server count. More complex or unknown aggregation
+shapes fail closed.
 
 ## Tributo downstream profile
 
@@ -80,7 +82,7 @@ The initial real-infrastructure matrix is intentionally explicit:
 | ClickHouse | `String`, `FixedString`, `LowCardinality`, `Nullable` | String, fixed-size binary, and declared nullability |
 | ClickHouse | `Date`, `Date32`, `DateTime`, `DateTime64` | `Date` is cast to `Date32`; `DateTime` is cast to `DateTime64(0)`; timezone and subsecond precision are retained |
 | ClickHouse | `UUID`, `IPv4`, `IPv6`, `Enum8/16` | Explicit, round-trip-tested `String` projection |
-| ClickHouse | `Array`, `Map`, and named or unnamed `Tuple` over supported children | Recursive Arrow list, map, and struct values; required child casts are applied recursively |
+| ClickHouse | `Array`, `Map`, and named or unnamed `Tuple` over supported children, including quoted Tuple field names | Recursive Arrow list, map, and struct values; required child casts are applied recursively |
 | Doris, MySQL and Flight | `BOOLEAN`, `TINYINT`, `SMALLINT`, `INT`, `BIGINT`, `FLOAT`, `DOUBLE`, Decimal P ≤ 38 | Common native Arrow scalar values |
 | Doris, MySQL and Flight | `CHAR`, `VARCHAR`, `STRING`, `JSON`, `DATE`, `DATETIMEV2` | Common string, Date32, and microsecond timestamp values |
 

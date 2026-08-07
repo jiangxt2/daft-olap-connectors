@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any, ClassVar, cast
 
@@ -77,6 +77,7 @@ from daft_olap.doris.sql import render_predicate as render_doris
         "Array(UInt8)",
         "Map(String, Int32)",
         "Tuple(String, value Nullable(Int64))",
+        "Tuple(`field name` String, `request-id` Int32, `tick``name` UUID)",
         "FixedString(1)",
         "FixedString(8)",
         "Decimal32(2)",
@@ -256,6 +257,12 @@ def test_doris_flight_literals_are_typed_and_never_embed_raw_strings() -> None:
     for value in (float("nan"), float("inf"), Decimal("NaN"), object()):
         with pytest.raises(ConfigurationError):
             render_flight_literal(value)
+    for value in (
+        datetime(2026, 1, 1, tzinfo=UTC),
+        time(12, 0, tzinfo=UTC),
+    ):
+        with pytest.raises(ConfigurationError, match="timezone-aware"):
+            render_flight_literal(value)
 
 
 def _predicate_tree() -> Or:
@@ -334,6 +341,59 @@ def test_clickhouse_select_validates_count_partition_parameters_and_limit() -> N
             )
 
 
+def test_clickhouse_select_protects_literal_percent_signs_on_every_binding_path() -> None:
+    sql, parameters = build_clickhouse_select(
+        table=QualifiedTable("db", "events"),
+        columns=("id",),
+        predicate=Compare(">", Column("score"), Literal(1)),
+        unsafe_where_sql="kind LIKE 'A%' AND modulo % 2 = 0 AND id >= %(minimum)s",
+        query_parameters=(("minimum", 10),),
+        partition_ids=("p1",),
+        limit=None,
+    )
+    assert "LIKE 'A%%'" in sql
+    assert "modulo %% 2" in sql
+    assert "%(minimum)s" in sql
+    assert dict(parameters)["minimum"] == 10
+    assert sql % {name: repr(value) for name, value in parameters}
+
+    unbound_sql, unbound_parameters = build_clickhouse_select(
+        table=QualifiedTable("db", "events"),
+        columns=("id",),
+        predicate=None,
+        unsafe_where_sql="kind LIKE 'A%'",
+        query_parameters=(),
+        partition_ids=None,
+        limit=None,
+    )
+    assert "LIKE 'A%'" in unbound_sql
+    assert unbound_parameters == ()
+    with pytest.raises(ConfigurationError, match="unused"):
+        build_clickhouse_select(
+            table=QualifiedTable("db", "events"),
+            columns=("id",),
+            predicate=None,
+            unsafe_where_sql="id > 0",
+            query_parameters=(("unused", 1),),
+            partition_ids=None,
+            limit=None,
+        )
+
+
+def test_clickhouse_select_rejects_undeclared_unsafe_placeholders() -> None:
+    for partition_ids in (None, ("p1",)):
+        with pytest.raises(ConfigurationError, match="missing parameter 'missing'"):
+            build_clickhouse_select(
+                table=QualifiedTable("db", "events"),
+                columns=("id",),
+                predicate=None,
+                unsafe_where_sql="kind = '%(missing)s'",
+                query_parameters=(),
+                partition_ids=partition_ids,
+                limit=None,
+            )
+
+
 def test_doris_select_validates_unsafe_markers_tablets_count_and_limit() -> None:
     sql, parameters = build_doris_select(
         table=QualifiedTable("db", "events"),
@@ -397,6 +457,47 @@ def test_doris_select_validates_unsafe_markers_tablets_count_and_limit() -> None
             )
 
 
+def test_doris_select_protects_percent_signs_and_rejects_unclosed_quotes() -> None:
+    sql, parameters = build_doris_select(
+        table=QualifiedTable("db", "events"),
+        columns=("id",),
+        style="mysql",
+        predicate=Compare(">", Column("score"), Literal(1)),
+        unsafe_where_sql="kind LIKE 'A%' AND modulo % 2 = 0 AND id >= :minimum",
+        query_parameters=(("minimum", 10),),
+        tablet_ids=(1,),
+        limit=None,
+    )
+    assert "LIKE 'A%%'" in sql
+    assert "modulo %% 2" in sql
+    assert parameters == (10, 1)
+    assert sql % tuple(repr(value) for value in parameters)
+
+    flight_sql, flight_parameters = build_doris_select(
+        table=QualifiedTable("db", "events"),
+        columns=("id",),
+        style="flight",
+        predicate=None,
+        unsafe_where_sql="kind LIKE 'A%' AND id >= :minimum",
+        query_parameters=(("minimum", 10),),
+        tablet_ids=None,
+        limit=None,
+    )
+    assert "LIKE 'A%'" in flight_sql
+    assert flight_parameters == ()
+    with pytest.raises(ConfigurationError, match="unclosed"):
+        build_doris_select(
+            table=QualifiedTable("db", "events"),
+            columns=("id",),
+            style="mysql",
+            predicate=None,
+            unsafe_where_sql="kind = 'unterminated :value",
+            query_parameters=(("value", "x"),),
+            tablet_ids=None,
+            limit=None,
+        )
+
+
 class FakeFrame:
     def __init__(self) -> None:
         self.filter_value: object | None = None
@@ -430,6 +531,7 @@ def test_top_level_api_exposes_stable_entry_points_and_error_contract() -> None:
         "CompatibilityError",
         "ConfigurationError",
         "DaftOlapError",
+        "DatabaseObjectNotFoundError",
         "DatabasePermissionError",
         "DependencyError",
         "DiscoveryError",

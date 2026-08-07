@@ -58,6 +58,10 @@ class Literal:
             )
         if isinstance(self.value, Decimal) and not self.value.is_finite():
             raise UnsupportedPredicateError("non-finite decimal literals are not pushed down")
+        if isinstance(self.value, (datetime, time)) and self.value.tzinfo is not None:
+            raise UnsupportedPredicateError(
+                "timezone-aware datetime and time literals are not pushed down"
+            )
 
 
 type Value = Column | Literal
