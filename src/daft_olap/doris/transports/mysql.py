@@ -23,8 +23,9 @@ from typing import Any
 import pyarrow as pa
 
 from daft_olap._common.contracts import QuerySpec, ResourceLimits, iter_batch_slices
-from daft_olap._common.errors import SchemaError, TransportError
+from daft_olap._common.errors import DaftOlapError, SchemaError, TransportError
 from daft_olap.doris.discovery import DorisConnection, mysql_driver
+from daft_olap.doris.errors import translate_doris_error
 from daft_olap.doris.schema import coerce_decimal
 from daft_olap.doris.transports._thread import TaskThread
 
@@ -183,11 +184,14 @@ async def stream_query(
     except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit) as exc:
         failure = exc
         raise
-    except (SchemaError, TransportError) as exc:
+    except DaftOlapError as exc:
         failure = exc
         raise
     except Exception as exc:
         failure = exc
+        translated = translate_doris_error(exc, operation="MySQL query execution")
+        if translated is not None:
+            raise translated from None
         raise TransportError("Doris MySQL query failed") from None
     finally:
         try:

@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import logging
 import pickle
+import threading
 from typing import Any, cast
 
 import daft
@@ -25,6 +27,7 @@ from daft_olap._common.errors import (
     AuthenticationError,
     CompatibilityError,
     ConfigurationError,
+    DatabaseObjectNotFoundError,
     DatabasePermissionError,
     DiscoveryError,
     SchemaError,
@@ -152,11 +155,15 @@ async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
     transport: DorisTransport,
 ) -> None:
     planning_calls: list[tuple[str, tuple[object, ...]]] = []
+    planning_thread: int | None = None
 
     def discover(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+        nonlocal planning_thread
+        planning_thread = threading.get_ident()
         planning_calls.append((sql, parameters))
         return (4, 2, 3, 1)
 
+    event_loop_thread = threading.get_ident()
     source = DorisDataSource(
         host="localhost",
         database="analytics",
@@ -175,6 +182,7 @@ async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
         )
     ]
     assert len(tasks) == 2
+    assert planning_thread is not None and planning_thread != event_loop_thread
     assert all(isinstance(task, DorisTask) for task in tasks)
     doris_tasks = [cast(DorisTask, task) for task in tasks]
     assert all(task._transport == transport for task in doris_tasks)
@@ -183,6 +191,97 @@ async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
     assert "%s" in planning_calls[0][0]
     assert "secret-value" not in repr(source)
     pickle.loads(pickle.dumps(tasks[0]))
+
+
+@pytest.mark.asyncio
+async def test_doris_discovery_policy_warns_only_for_single_task_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "must-not-be-logged"
+
+    def fail_discovery(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+        raise DiscoveryError(f"driver detail: {secret}")
+
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="mysql",
+        password=secret,
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=fail_discovery,
+    )
+    with caplog.at_level(logging.WARNING, logger="daft_olap.doris.datasource"):
+        tasks = [task async for task in source.get_tasks(Pushdowns())]
+
+    assert len(tasks) == 1
+    assert "TABLET(" not in cast(DorisTask, tasks[0])._query.sql
+    assert caplog.messages == [
+        "Doris tablet discovery failed for 'analytics'.'events' "
+        "(DiscoveryError); falling back to one task"
+    ]
+    assert secret not in caplog.text
+
+    caplog.clear()
+    strict_source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="mysql",
+        password=secret,
+        discovery_policy="error",
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=fail_discovery,
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="daft_olap.doris.datasource"),
+        pytest.raises(DiscoveryError),
+    ):
+        _ = [task async for task in strict_source.get_tasks(Pushdowns())]
+    assert caplog.messages == []
+
+
+@pytest.mark.asyncio
+async def test_doris_empty_tablet_pruning_emits_one_limit_zero_task() -> None:
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="mysql",
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=lambda sql, parameters: (),
+    )
+    tasks = [cast(DorisTask, task) async for task in source.get_tasks(Pushdowns())]
+    assert len(tasks) == 1
+    assert "TABLET(" not in tasks[0]._query.sql
+    assert tasks[0]._query.sql.endswith("LIMIT 0")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AuthenticationError("auth"),
+        DatabasePermissionError("permission"),
+        DatabaseObjectNotFoundError("missing"),
+    ],
+)
+async def test_doris_nonrecoverable_discovery_errors_never_fall_back(
+    failure: BaseException,
+) -> None:
+    def fail_discovery(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+        raise failure
+
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="mysql",
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=fail_discovery,
+    )
+    with pytest.raises(type(failure)):
+        _ = [task async for task in source.get_tasks(Pushdowns())]
 
 
 @pytest.mark.asyncio

@@ -98,7 +98,8 @@ CREATE TABLE analytics.type_matrix
     map_value Map(String, Int32),
     tuple_value Tuple(String, Int32),
     nested_date_values Array(Date),
-    semantic_tuple Tuple(observed DateTime('UTC'), request_id UUID)
+    semantic_tuple Tuple(observed DateTime('UTC'), request_id UUID),
+    quoted_tuple Tuple(`field name` String, `request-id` Int32)
 )
 ENGINE = MergeTree
 ORDER BY id;
@@ -112,7 +113,8 @@ INSERT INTO analytics.type_matrix VALUES
         '12345678-1234-5678-1234-567812345678', '192.0.2.1', '2001:db8::1',
         'second', 'second', [1, 2, 3], map('alpha', 1, 'beta', 2), ('tuple', 7),
         ['2026-04-01', '2026-04-02'],
-        ('2026-04-01 01:02:03', '12345678-1234-5678-1234-567812345678')
+        ('2026-04-01 01:02:03', '12345678-1234-5678-1234-567812345678'),
+        ('named field', 42)
     );
 
 CREATE TABLE analytics.empty_nested_types
@@ -130,3 +132,17 @@ CREATE TABLE analytics.unsupported_types
 )
 ENGINE = MergeTree
 ORDER BY id;
+
+CREATE TABLE analytics.partition_id_collision
+(
+    id UInt64,
+    `_partition_id` String,
+    event_date Date
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_date)
+ORDER BY id;
+
+INSERT INTO analytics.partition_id_collision VALUES
+    (1, 'business-a', '2026-01-01'),
+    (2, 'business-b', '2026-02-01');

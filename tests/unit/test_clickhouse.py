@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import logging
 import pickle
+import threading
 from typing import Any, cast
 
 import daft
@@ -21,7 +23,15 @@ import pytest
 from daft.expressions import Expression
 from daft.io.pushdowns import Pushdowns
 
-from daft_olap._common.errors import CompatibilityError, ConfigurationError, SchemaError
+from daft_olap._common.errors import (
+    AuthenticationError,
+    CompatibilityError,
+    ConfigurationError,
+    DatabaseObjectNotFoundError,
+    DatabasePermissionError,
+    DiscoveryError,
+    SchemaError,
+)
 from daft_olap._common.identifiers import QualifiedTable
 from daft_olap._common.predicate_ir import Column, Compare, Literal
 from daft_olap.clickhouse.datasource import ClickHouseDataSource
@@ -84,6 +94,7 @@ def test_clickhouse_schema_projection_applies_only_lossless_transport_casts() ->
             ("status", "Enum8('ready' = 1)"),
             ("history", "Array(Date)"),
             ("details", "Tuple(at DateTime, request_id UUID)"),
+            ("quoted", "Tuple(`field name` DateTime, `request-id` UUID)"),
         ]
     )
     assert render_schema_projection(columns) == (
@@ -92,7 +103,8 @@ def test_clickhouse_schema_projection_applies_only_lossless_transport_casts() ->
         "CAST(`address` AS Nullable(String)) AS `address`, "
         "CAST(`status` AS String) AS `status`, "
         "CAST(`history` AS Array(Date32)) AS `history`, "
-        "CAST(`details` AS Tuple(at DateTime64(0), request_id String)) AS `details`"
+        "CAST(`details` AS Tuple(at DateTime64(0), request_id String)) AS `details`, "
+        "CAST(`quoted` AS Tuple(`field name` DateTime64(0), `request-id` String)) AS `quoted`"
     )
     with pytest.raises(SchemaError, match="timezone"):
         parse_describe_columns([("observed", "DateTime('UTC OR 1=1')")])
@@ -192,6 +204,21 @@ def test_clickhouse_query_parameters_require_unsafe_fragment() -> None:
 async def test_clickhouse_datasource_plans_bounded_partition_tasks_and_hidden_filter_column() -> (
     None
 ):
+    planning_thread: int | None = None
+
+    def discover() -> PartitionDiscovery:
+        nonlocal planning_thread
+        planning_thread = threading.get_ident()
+        return PartitionDiscovery(
+            True,
+            (
+                PartitionMetadata("p1", 100),
+                PartitionMetadata("p2", 80),
+                PartitionMetadata("p3", 10),
+            ),
+        )
+
+    event_loop_thread = threading.get_ident()
     source = ClickHouseDataSource(
         host="localhost",
         database="analytics",
@@ -200,14 +227,7 @@ async def test_clickhouse_datasource_plans_bounded_partition_tasks_and_hidden_fi
         target_tasks=2,
         max_tasks=2,
         _arrow_schema=SCHEMA,
-        _partition_discoverer=lambda: PartitionDiscovery(
-            True,
-            (
-                PartitionMetadata("p1", 100),
-                PartitionMetadata("p2", 80),
-                PartitionMetadata("p3", 10),
-            ),
-        ),
+        _partition_discoverer=discover,
     )
     pushdowns = Pushdowns(
         filters=_greater_than("score", 5),
@@ -216,6 +236,7 @@ async def test_clickhouse_datasource_plans_bounded_partition_tasks_and_hidden_fi
     )
     tasks = [task async for task in source.get_tasks(pushdowns)]
     assert len(tasks) == 2
+    assert planning_thread is not None and planning_thread != event_loop_thread
     assert all(isinstance(task, ClickHouseTask) for task in tasks)
     clickhouse_tasks = [cast(ClickHouseTask, task) for task in tasks]
     assert all(task.schema.column_names() == ["kind", "score"] for task in clickhouse_tasks)
@@ -223,6 +244,97 @@ async def test_clickhouse_datasource_plans_bounded_partition_tasks_and_hidden_fi
     assert "secret-value" not in repr(source)
     assert "secret-value" not in repr(tasks[0])
     pickle.loads(pickle.dumps(tasks[0]))
+
+
+@pytest.mark.asyncio
+async def test_clickhouse_discovery_policy_warns_only_for_single_task_fallback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "must-not-be-logged"
+
+    def fail_discovery() -> PartitionDiscovery:
+        raise DiscoveryError(f"driver detail: {secret}")
+
+    source = ClickHouseDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        password=secret,
+        _arrow_schema=SCHEMA,
+        _partition_discoverer=fail_discovery,
+    )
+    with caplog.at_level(logging.WARNING, logger="daft_olap.clickhouse.datasource"):
+        tasks = [task async for task in source.get_tasks(Pushdowns())]
+
+    assert len(tasks) == 1
+    assert "_partition_id" not in cast(ClickHouseTask, tasks[0])._query.sql
+    assert caplog.messages == [
+        "ClickHouse partition discovery failed for 'analytics'.'events' "
+        "(DiscoveryError); falling back to one task"
+    ]
+    assert secret not in caplog.text
+
+    caplog.clear()
+    strict_source = ClickHouseDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        password=secret,
+        discovery_policy="error",
+        _arrow_schema=SCHEMA,
+        _partition_discoverer=fail_discovery,
+    )
+    with (
+        caplog.at_level(logging.WARNING, logger="daft_olap.clickhouse.datasource"),
+        pytest.raises(DiscoveryError),
+    ):
+        _ = [task async for task in strict_source.get_tasks(Pushdowns())]
+    assert caplog.messages == []
+
+
+@pytest.mark.asyncio
+async def test_clickhouse_physical_partition_column_disables_virtual_partition_splitting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    schema = SCHEMA.append(pa.field("_partition_id", pa.string()))
+    source = ClickHouseDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        _arrow_schema=schema,
+        _partition_discoverer=lambda: pytest.fail("physical column must bypass discovery"),
+    )
+    with caplog.at_level(logging.WARNING, logger="daft_olap.clickhouse.datasource"):
+        tasks = [cast(ClickHouseTask, task) async for task in source.get_tasks(Pushdowns())]
+    assert len(tasks) == 1
+    assert "(_partition_id IN" not in tasks[0]._query.sql
+    assert "physical _partition_id column" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AuthenticationError("auth"),
+        DatabasePermissionError("permission"),
+        DatabaseObjectNotFoundError("missing"),
+    ],
+)
+async def test_clickhouse_nonrecoverable_discovery_errors_never_fall_back(
+    failure: BaseException,
+) -> None:
+    def fail_discovery() -> PartitionDiscovery:
+        raise failure
+
+    source = ClickHouseDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        _arrow_schema=SCHEMA,
+        _partition_discoverer=fail_discovery,
+    )
+    with pytest.raises(type(failure)):
+        _ = [task async for task in source.get_tasks(Pushdowns())]
 
 
 @pytest.mark.asyncio

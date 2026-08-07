@@ -10,6 +10,10 @@ Do not place credentials in a hostname, database name, table name, client option
 logging, benchmark label, or raw SQL. Exceptions deliberately omit DSNs, SQL parameter values, and
 driver exception text that may contain credentials.
 
+Serialized `QuerySpec` values remain necessary for worker execution, but their representation hides
+the complete SQL and every parameter value. Only parameter shape and the canonical Arrow schema are
+shown.
+
 Public exception categories and Daft/Ray wrapping behavior are specified in the
 [error contract](errors.md). Cancellation is preserved as `asyncio.CancelledError`; sanitized
 timeout failures never include driver URLs or parameter values.
@@ -28,6 +32,11 @@ Application data must use `query_parameters`: clickhouse-connect named parameter
 and connector-neutral `:name` markers for Doris. Doris replaces markers only outside SQL quotes,
 requires an exact parameter set, and delegates binding to PyMySQL or typed materialization to the
 Flight renderer. Application-provided string formatting is never accepted as a substitute.
+
+Literal percent signs in trusted SQL are preserved by the connector when PyMySQL or
+clickhouse-connect performs Python-style parameter formatting; callers write normal SQL with a
+single `%`. Timezone-aware `datetime` and `time` parameters and predicate literals fail closed so a
+driver cannot silently discard an offset or reinterpret an ISO string.
 
 ## Network security
 

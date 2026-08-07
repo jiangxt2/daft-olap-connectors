@@ -30,6 +30,8 @@ from daft_olap._common.errors import (
     AuthenticationError,
     CompatibilityError,
     ConfigurationError,
+    DaftOlapError,
+    DatabaseObjectNotFoundError,
     DatabasePermissionError,
     DependencyError,
     DiscoveryError,
@@ -43,6 +45,7 @@ from daft_olap._common.redaction import (
     validate_secret,
 )
 from daft_olap._compat import validate_daft_arrow_schema
+from daft_olap.doris.errors import translate_doris_error
 from daft_olap.doris.schema import canonical_schema, parse_describe_rows
 from daft_olap.doris.sql import build_describe
 
@@ -80,6 +83,7 @@ _MAX_PORT = 65_535
 _MAX_QUERY_PLAN_RESPONSE_BYTES = 16 * 1024 * 1024
 _HTTP_OK = 200
 _HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -278,7 +282,10 @@ def discover_schema(
         failure = exc
         raise
     except Exception as exc:
-        failure = exc
+        translated = translate_doris_error(exc, operation="schema discovery")
+        failure = translated or exc
+        if translated is not None:
+            raise translated from None
         raise SchemaError(
             f"failed to discover Doris schema for {table.database!r}.{table.table!r}"
         ) from None
@@ -297,6 +304,8 @@ def _materialize_plan_sql(
     limits: ResourceLimits,
 ) -> str:
     """Ask PyMySQL to escape bound values before sending SQL to the parameterless HTTP API."""
+    if not parameters:
+        return sql
     database_connection = None
     cursor = None
     failure: BaseException | None = None
@@ -304,11 +313,14 @@ def _materialize_plan_sql(
         database_connection = mysql_driver().connect(**connection.mysql_kwargs(limits))
         cursor = database_connection.cursor()
         rendered = cursor.mogrify(sql, parameters)
-    except DependencyError as exc:
+    except DaftOlapError as exc:
         failure = exc
         raise
     except Exception as exc:
-        failure = exc
+        translated = translate_doris_error(exc, operation="tablet query binding")
+        failure = translated or exc
+        if translated is not None:
+            raise translated from None
         raise DiscoveryError("failed to bind the Doris tablet-planning query") from None
     except BaseException as exc:
         failure = exc
@@ -333,10 +345,7 @@ def parse_query_plan_response(payload: Any) -> tuple[int, ...]:
         raise DiscoveryError("Doris query-plan response has no data object")
     status = data.get("status")
     if status == "1":
-        exception = str(data.get("exception", ""))
-        if exception.startswith("Access denied"):
-            raise DatabasePermissionError("Doris denied SELECT during tablet planning")
-        raise DiscoveryError("Doris query-plan service rejected the query")
+        _raise_query_plan_rejection(data.get("exception"))
     if status != _HTTP_OK:
         raise DiscoveryError("Doris query-plan response has an invalid status")
     partitions = data.get("partitions")
@@ -354,6 +363,17 @@ def parse_query_plan_response(payload: Any) -> tuple[int, ...]:
     if len(set(tablet_ids)) != len(tablet_ids):
         raise DiscoveryError("Doris query-plan returned duplicate tablet IDs")
     return tuple(sorted(tablet_ids))
+
+
+def _raise_query_plan_rejection(exception: object) -> None:
+    normalized_exception = str(exception or "").casefold()
+    if normalized_exception.startswith("access denied"):
+        raise DatabasePermissionError("Doris denied SELECT during tablet planning")
+    if "unknown table" in normalized_exception or "does not exist" in normalized_exception:
+        raise DatabaseObjectNotFoundError(
+            "Doris database object was not found during tablet planning"
+        )
+    raise DiscoveryError("Doris query-plan service rejected the query")
 
 
 def discover_tablets(
@@ -387,6 +407,8 @@ def discover_tablets(
     except urllib.error.HTTPError as exc:
         if exc.code == _HTTP_UNAUTHORIZED:
             raise AuthenticationError("Doris rejected query-plan credentials") from None
+        if exc.code == _HTTP_FORBIDDEN:
+            raise DatabasePermissionError("Doris denied access to tablet planning") from None
         raise DiscoveryError(f"Doris query-plan endpoint returned HTTP {exc.code}") from None
     except (OSError, TimeoutError):
         raise DiscoveryError("Doris query-plan endpoint is unavailable") from None

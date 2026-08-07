@@ -21,9 +21,10 @@ from typing import Any
 import pyarrow as pa
 
 from daft_olap._common.contracts import QuerySpec, ResourceLimits, iter_batch_slices
-from daft_olap._common.errors import DependencyError, SchemaError, TransportError
+from daft_olap._common.errors import DaftOlapError, DependencyError, SchemaError, TransportError
 from daft_olap._common.redaction import resolve_secret
 from daft_olap.doris.discovery import DorisConnection
+from daft_olap.doris.errors import translate_doris_error
 from daft_olap.doris.transports._thread import TaskThread
 
 FlightConnectionFactory = Callable[..., Any]
@@ -50,6 +51,10 @@ def cast_batch(batch: pa.RecordBatch, schema: pa.Schema) -> pa.RecordBatch:
         if batch.schema.equals(schema, check_metadata=False):
             return pa.RecordBatch.from_arrays(batch.columns, schema=schema)
         table = pa.Table.from_batches([batch]).cast(schema, safe=True).combine_chunks()
+        if table.num_rows == 0:
+            return pa.RecordBatch.from_arrays(
+                [pa.array([], type=field.type) for field in schema], schema=schema
+            )
         batches = table.to_batches(max_chunksize=max(table.num_rows, 1))
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError, ValueError):
         raise SchemaError("Doris Flight result does not match the planned schema") from None
@@ -158,11 +163,14 @@ async def stream_query(
     except (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt, SystemExit) as exc:
         failure = exc
         raise
-    except (DependencyError, SchemaError, TransportError) as exc:
+    except DaftOlapError as exc:
         failure = exc
         raise
     except Exception as exc:
         failure = exc
+        translated = translate_doris_error(exc, operation="Flight query execution")
+        if translated is not None:
+            raise translated from None
         raise TransportError("Doris Flight query failed") from None
     finally:
         try:

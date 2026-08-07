@@ -28,12 +28,19 @@ import pyarrow as pa
 import pytest
 import ray
 from daft.exceptions import DaftCoreException
+from daft.io.pushdowns import Pushdowns
 from daft.io.source import DataSourceTask
 from daft.recordbatch import RecordBatch
 
 from daft_olap import read_doris
 from daft_olap._common.contracts import QuerySpec, ResourceLimits
-from daft_olap._common.errors import DatabasePermissionError, DiscoveryError, SchemaError
+from daft_olap._common.errors import (
+    AuthenticationError,
+    DatabaseObjectNotFoundError,
+    DatabasePermissionError,
+    DiscoveryError,
+    SchemaError,
+)
 from daft_olap._common.identifiers import QualifiedTable
 from daft_olap.doris.datasource import DorisDataSource
 from daft_olap.doris.discovery import DorisConnection, discover_tablets
@@ -262,7 +269,48 @@ def test_trusted_filter_uses_selected_transport_binding(transport: str) -> None:
     assert injection.read().count().to_pydict() == {"count": [0]}
 
 
-def test_query_plan_returns_tablets_and_strict_discovery_does_not_fallback() -> None:
+@pytest.mark.parametrize("transport", ["mysql", "flight"])
+def test_literal_percent_with_bound_values_uses_selected_transport(transport: str) -> None:
+    source = DorisDataSource(
+        host="127.0.0.1",
+        mysql_port=_mysql_port(),
+        http_port=_http_port(),
+        flight_port=_flight_port(),
+        database="analytics",
+        table="events",
+        transport=transport,
+        split="auto",
+        unsafe_where_sql="kind LIKE 'a%' AND score >= :minimum",
+        query_parameters={"minimum": 25},
+    )
+    assert source.read().select("id").sort("id").to_pydict() == {"id": [3, 7]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["mysql", "flight"])
+async def test_empty_fe_pruning_emits_and_executes_one_limit_zero_task(transport: str) -> None:
+    source = DorisDataSource(
+        host="127.0.0.1",
+        mysql_port=_mysql_port(),
+        http_port=_http_port(),
+        flight_port=_flight_port(),
+        database="analytics",
+        table="events",
+        transport=transport,
+        split="auto",
+        unsafe_where_sql="FALSE",
+    )
+    tasks = [task async for task in source.get_tasks(Pushdowns())]
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert isinstance(task, DorisTask)
+    assert "TABLET(" not in task._query.sql
+    assert task._query.sql.endswith("LIMIT 0")
+    assert [batch async for batch in task.read()] == []
+
+
+@pytest.mark.asyncio
+async def test_query_plan_returns_tablets_and_strict_discovery_does_not_fallback() -> None:
     connection = DorisConnection(
         host="127.0.0.1",
         mysql_port=_mysql_port(),
@@ -322,6 +370,19 @@ def test_query_plan_returns_tablets_and_strict_discovery_does_not_fallback() -> 
             parameters,
             ResourceLimits(),
         )
+    no_access = DorisDataSource(
+        host="127.0.0.1",
+        mysql_port=_mysql_port(),
+        http_port=_http_port(),
+        flight_port=_flight_port(),
+        username="daft_no_access",
+        password="no-access-password",
+        database="analytics",
+        table="events",
+        transport="mysql",
+    )
+    with pytest.raises(DatabasePermissionError):
+        _ = [task async for task in no_access.get_tasks(Pushdowns())]
 
     fallback = _source(transport="mysql", split="auto", http_port=1)
     assert fallback.read().select("id").sort("id").to_pydict() == {"id": list(range(1, 9))}
@@ -387,7 +448,7 @@ async def test_real_transport_is_multibatch_and_can_close_early(transport: str) 
 
 def test_bad_doris_credentials_fail_closed_without_secret_disclosure() -> None:
     secret = "never-echo-this-doris-password"
-    with pytest.raises(SchemaError) as error:
+    with pytest.raises(AuthenticationError) as error:
         DorisDataSource(
             host="127.0.0.1",
             mysql_port=_mysql_port(),
@@ -400,6 +461,11 @@ def test_bad_doris_credentials_fail_closed_without_secret_disclosure() -> None:
             transport="mysql",
         )
     assert secret not in str(error.value)
+
+
+def test_missing_doris_table_has_a_stable_public_error() -> None:
+    with pytest.raises(DatabaseObjectNotFoundError):
+        _source(table="missing_events", split="auto")
 
 
 def test_flight_failure_never_falls_back_to_mysql() -> None:

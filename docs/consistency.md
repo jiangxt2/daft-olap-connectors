@@ -22,14 +22,19 @@ Automatic splitting also requires the configured endpoint to keep discovery and 
 queries on the same ClickHouse server. A load balancer that can route tasks to different replicas or
 shards violates that precondition; use a server-pinned endpoint or `split="single"`.
 
-Replicated/Shared engines, views, Distributed tables, unverified engines, missing metadata, and
-insufficient metadata access fall back to one task unless strict discovery is requested.
+Replicated/Shared engines, views, Distributed tables, unverified engines, and a physical
+`_partition_id` column use one task. A recoverable metadata discovery failure falls back only when
+`discovery_policy="single"`; authentication, permission, and confirmed object-not-found failures
+are fatal under both policies.
 
 ## Apache Doris
 
 FE planning and task execution are separate operations. The connector uses the same projection and
 supported predicate for planning and execution, but metadata can change between them. It does not
 execute FE's opaque direct-BE plan. Stable-table IT compares tablet tasks with a single query.
+
+If FE successfully prunes the query to no tablets, the connector emits one `LIMIT 0` task. An empty
+tablet set therefore means zero rows and never means an unrestricted single-task scan.
 
 A failure in an explicitly selected Doris transport terminates that task. The connector never
 replays it through another protocol, before or after the first batch, so transport availability

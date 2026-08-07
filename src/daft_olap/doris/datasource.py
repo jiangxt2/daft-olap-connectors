@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import pyarrow as pa
@@ -28,6 +31,7 @@ from daft_olap._common.contracts import (
     ResourceLimits,
     SplitMode,
     group_adjacent_ids,
+    validate_query_parameter_values,
 )
 from daft_olap._common.errors import CompatibilityError, ConfigurationError, DiscoveryError
 from daft_olap._common.identifiers import QualifiedTable
@@ -54,6 +58,14 @@ TabletDiscoverer = Callable[[str, tuple[Any, ...]], tuple[int, ...]]
 DorisTaskFactory = Callable[
     [DorisConnection, QuerySpec, ResourceLimits, DorisTransport], DataSourceTask
 ]
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _TabletPlan:
+    groups: tuple[tuple[int, ...] | None, ...]
+    empty_result: bool = False
 
 
 class DorisDataSource(DataSource):
@@ -102,6 +114,7 @@ class DorisDataSource(DataSource):
         parameters = tuple((query_parameters or {}).items())
         if any(not isinstance(key, str) or not key for key, _ in parameters):
             raise ConfigurationError("query parameter names must be non-empty strings")
+        validate_query_parameter_values(value for _, value in parameters)
         self._table = QualifiedTable(database, table)
         self._transport = transport
         self._split = split
@@ -148,15 +161,15 @@ class DorisDataSource(DataSource):
     def supports_count_pushdown(self) -> bool:
         return count_pushdown_available()
 
-    def _tablet_groups(
+    async def _tablet_plan(
         self,
         *,
         columns: tuple[str, ...],
         predicate: Predicate | None,
         limit: int | None,
-    ) -> tuple[tuple[int, ...] | None, ...]:
+    ) -> _TabletPlan:
         if self._split == "single" or limit == 0:
-            return (None,)
+            return _TabletPlan((None,))
         planning_sql, planning_parameters = build_select(
             table=self._table,
             columns=columns,
@@ -168,29 +181,37 @@ class DorisDataSource(DataSource):
             limit=None,
         )
         try:
-            tablet_ids = (
-                self._tablet_discoverer(planning_sql, planning_parameters)
-                if self._tablet_discoverer is not None
-                else discover_tablets(
+            if self._tablet_discoverer is not None:
+                tablet_ids = await asyncio.to_thread(
+                    self._tablet_discoverer, planning_sql, planning_parameters
+                )
+            else:
+                tablet_ids = await asyncio.to_thread(
+                    discover_tablets,
                     self._connection,
                     self._table,
                     planning_sql,
                     planning_parameters,
                     self._limits,
                 )
-            )
-        except DiscoveryError:
+        except DiscoveryError as error:
             if self._discovery_policy == "error":
                 raise
-            return (None,)
+            logger.warning(
+                "Doris tablet discovery failed for %r.%r (%s); falling back to one task",
+                self._table.database,
+                self._table.table,
+                type(error).__name__,
+            )
+            return _TabletPlan((None,))
         if not tablet_ids:
-            return (None,)
+            return _TabletPlan((None,), empty_result=True)
         groups = group_adjacent_ids(
             tablet_ids,
             target_groups=self._limits.target_tasks,
             max_groups=self._limits.max_tasks,
         )
-        return tuple(groups)
+        return _TabletPlan(tuple(groups))
 
     async def get_tasks(self, pushdowns: Pushdowns) -> AsyncIterator[DataSourceTask]:
         count = count_pushdown(pushdowns)
@@ -223,11 +244,13 @@ class DorisDataSource(DataSource):
         task_schema = project_schema(self._arrow_schema, columns)
         predicate = compile_filter(pushdowns.filters)
         database_limit = safe_database_limit(pushdowns, predicate)
-        for tablet_ids in self._tablet_groups(
+        tablet_plan = await self._tablet_plan(
             columns=columns,
             predicate=predicate,
             limit=database_limit,
-        ):
+        )
+        task_limit = 0 if tablet_plan.empty_result else database_limit
+        for tablet_ids in tablet_plan.groups:
             sql, parameters = build_select(
                 table=self._table,
                 columns=columns,
@@ -236,7 +259,7 @@ class DorisDataSource(DataSource):
                 unsafe_where_sql=self._unsafe_where_sql,
                 query_parameters=self._query_parameters,
                 tablet_ids=tablet_ids,
-                limit=database_limit,
+                limit=task_limit,
             )
             yield self._task_factory(
                 self._connection,

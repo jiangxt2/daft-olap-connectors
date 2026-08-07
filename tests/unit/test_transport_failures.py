@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -23,7 +24,14 @@ import pyarrow as pa
 import pytest
 
 from daft_olap._common.contracts import QuerySpec, ResourceLimits
-from daft_olap._common.errors import DependencyError, SchemaError, TransportError
+from daft_olap._common.errors import (
+    AuthenticationError,
+    DatabaseObjectNotFoundError,
+    DatabasePermissionError,
+    DependencyError,
+    SchemaError,
+    TransportError,
+)
 from daft_olap.clickhouse import task as clickhouse_task_module
 from daft_olap.clickhouse import transport as clickhouse
 from daft_olap.clickhouse.discovery import ClickHouseConnection
@@ -32,6 +40,7 @@ from daft_olap.doris import task as doris_task_module
 from daft_olap.doris.discovery import DorisConnection
 from daft_olap.doris.task import DorisTask
 from daft_olap.doris.transports import flight, mysql
+from daft_olap.doris.transports._thread import TaskThread
 
 
 def test_arrow_batch_casts_preserve_schema_and_fail_closed() -> None:
@@ -42,6 +51,11 @@ def test_arrow_batch_casts_preserve_schema_and_fail_closed() -> None:
     assert clickhouse_cast.schema == int64_schema
     assert flight_cast.schema == int64_schema
     assert clickhouse_cast.to_pydict() == {"id": [1, 2]}
+    empty = pa.record_batch([pa.array([], type=pa.int32())], names=["id"])
+    for cast_batch in (clickhouse.cast_batch, flight.cast_batch):
+        empty_cast = cast_batch(empty, int64_schema)
+        assert empty_cast.num_rows == 0
+        assert empty_cast.schema == int64_schema
     with pytest.raises(SchemaError, match="columns"):
         clickhouse.cast_batch(int32_batch, pa.schema([("other", pa.int64())]))
     with pytest.raises(SchemaError, match="columns"):
@@ -165,6 +179,22 @@ async def test_clickhouse_stream_classifies_non_batch_driver_and_close_failures(
     _install_async_client(monkeypatch, close_failure)
     with pytest.raises(TransportError, match="close"):
         _ = [batch async for batch in clickhouse.stream_query(*_clickhouse_stream())]
+
+
+@pytest.mark.asyncio
+async def test_clickhouse_stream_translates_structured_server_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "private server detail"
+    error = RuntimeError(secret)
+    structured_error = cast(Any, error)
+    structured_error.code = 516
+    structured_error.name = "AUTHENTICATION_FAILED"
+    client = AsyncClient(AsyncContext([]), query_error=error)
+    _install_async_client(monkeypatch, client)
+    with pytest.raises(AuthenticationError) as translated:
+        await anext(clickhouse.stream_query(*_clickhouse_stream()))
+    assert secret not in str(translated.value)
 
 
 @pytest.mark.asyncio
@@ -394,6 +424,64 @@ async def test_doris_stream_orchestration_success_errors_cancellation_and_cleanu
     _reset_stub([None], close_error=RuntimeError("close"))
     with pytest.raises(TransportError, match="close"):
         _ = [value async for value in module.stream_query(*args)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module", "failure", "expected_type"),
+    [
+        (mysql, RuntimeError(1045, "private auth detail"), AuthenticationError),
+        (mysql, RuntimeError(1142, "private permission detail"), DatabasePermissionError),
+        (mysql, RuntimeError(1146, "private table detail"), DatabaseObjectNotFoundError),
+    ],
+)
+async def test_doris_stream_translates_structured_driver_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    module: Any,
+    failure: BaseException,
+    expected_type: type[BaseException],
+) -> None:
+    monkeypatch.setattr(module, "MySqlBatchReader", StubBatchReader)
+    _reset_stub([], start_error=failure)
+    stream = module.stream_query(
+        DorisConnection(host="host", database="db"),
+        QuerySpec(sql="SELECT id", arrow_schema=pa.schema([("id", pa.int64())])),
+        ResourceLimits(),
+    )
+    with pytest.raises(expected_type) as translated:
+        await anext(stream)
+    assert "private" not in str(translated.value)
+
+
+@pytest.mark.asyncio
+async def test_flight_stream_translates_structured_adbc_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = RuntimeError("private flight detail")
+    cast(Any, failure).status_code = 14
+    monkeypatch.setattr(flight, "FlightBatchReader", StubBatchReader)
+    _reset_stub([], start_error=failure)
+    stream = flight.stream_query(
+        DorisConnection(host="host", database="db"),
+        QuerySpec(sql="SELECT id", arrow_schema=pa.schema([("id", pa.int64())])),
+        ResourceLimits(),
+    )
+    with pytest.raises(DatabasePermissionError) as translated:
+        await anext(stream)
+    assert "private" not in str(translated.value)
+
+
+@pytest.mark.asyncio
+async def test_task_thread_logs_only_close_failure_category(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    thread = TaskThread(name="test-close")
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    future.set_exception(RuntimeError("private close detail"))
+    with caplog.at_level(logging.WARNING, logger="daft_olap.doris.transports._thread"):
+        thread._shutdown(future)
+    assert caplog.messages == ["Doris task-thread resource close failed (RuntimeError)"]
+    assert "private close detail" not in caplog.text
 
 
 @pytest.mark.asyncio

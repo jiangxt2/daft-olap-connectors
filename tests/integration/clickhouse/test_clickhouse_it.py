@@ -34,7 +34,11 @@ from daft.recordbatch import RecordBatch
 
 from daft_olap import read_clickhouse
 from daft_olap._common.contracts import QuerySpec, ResourceLimits
-from daft_olap._common.errors import SchemaError
+from daft_olap._common.errors import (
+    AuthenticationError,
+    DatabaseObjectNotFoundError,
+    SchemaError,
+)
 from daft_olap._common.identifiers import QualifiedTable
 from daft_olap.clickhouse.datasource import ClickHouseDataSource
 from daft_olap.clickhouse.discovery import (
@@ -223,6 +227,28 @@ def test_trusted_filter_is_bound_and_empty_table_preserves_schema() -> None:
     assert empty_nested.schema.field("nullable_low_cardinality").type == pa.large_string()
 
 
+def test_literal_percent_binding_and_physical_partition_column_are_safe() -> None:
+    filtered = ClickHouseDataSource(
+        host="127.0.0.1",
+        port=_port(),
+        username="connector",
+        password=_password(),
+        database="analytics",
+        table="events",
+        split="auto",
+        unsafe_where_sql="kind LIKE 'a%' AND score >= %(minimum)s",
+        query_parameters={"minimum": 5},
+        target_tasks=3,
+    )
+    assert filtered.read().select("id").sort("id").to_pydict() == {"id": [1, 3, 7]}
+
+    collision = _source(table="partition_id_collision", split="auto").read()
+    assert collision.select("id", "_partition_id").sort("id").to_pydict() == {
+        "id": [1, 2],
+        "_partition_id": ["business-a", "business-b"],
+    }
+
+
 def test_supported_clickhouse_type_matrix_uses_stable_arrow_values() -> None:
     table = _source(table="type_matrix", split="single").read().to_arrow()
     assert table.num_rows == 1
@@ -253,6 +279,7 @@ def test_supported_clickhouse_type_matrix_uses_stable_arrow_values() -> None:
     assert row["nested_date_values"] == [date(2026, 4, 1), date(2026, 4, 2)]
     assert row["semantic_tuple"]["observed"].isoformat() == "2026-04-01T01:02:03+00:00"
     assert row["semantic_tuple"]["request_id"] == "12345678-1234-5678-1234-567812345678"
+    assert row["quoted_tuple"] == {"field name": "named field", "request-id": 42}
 
 
 def test_clickhouse_type_unsupported_by_daft_fails_during_schema_discovery() -> None:
@@ -325,7 +352,7 @@ async def test_real_stream_is_bounded_exhaustive_and_can_close_early() -> None:
 
 def test_bad_credentials_fail_closed_without_secret_disclosure() -> None:
     secret = "never-echo-this-password"
-    with pytest.raises(SchemaError) as error:
+    with pytest.raises(AuthenticationError) as error:
         ClickHouseDataSource(
             host="127.0.0.1",
             port=_port(),
@@ -335,6 +362,11 @@ def test_bad_credentials_fail_closed_without_secret_disclosure() -> None:
             table="events",
         )
     assert secret not in str(error.value)
+
+
+def test_missing_clickhouse_table_has_a_stable_public_error() -> None:
+    with pytest.raises(DatabaseObjectNotFoundError):
+        _source(table="missing_events", split="auto")
 
 
 @pytest.mark.ray

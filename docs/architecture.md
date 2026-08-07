@@ -6,6 +6,11 @@ The driver discovers a canonical schema and safe split units. It creates immutab
 specifications containing a redacted connection configuration, transport-safe SQL, canonical Arrow
 schema, and partition or tablet identifiers. Live clients are never serialized.
 
+Network-backed split discovery is awaited from `get_tasks()` through a worker thread so synchronous
+ClickHouse metadata, PyMySQL binding, and Doris FE HTTP calls do not block Daft's async planning
+loop. Planning still completes before tasks are emitted and its latency remains part of DataSource
+planning. A parameterless Doris planning query bypasses the temporary PyMySQL binding connection.
+
 Workers create one selected transport per task:
 
 - ClickHouse: `clickhouse-connect` async Arrow stream;
@@ -34,13 +39,20 @@ wrapper does not declare filter absorption, Daft also reapplies successfully pus
 nonzero limit reaches database SQL only when there is no filter or the entire filter was compiled;
 otherwise Daft applies the limit after its residual filter.
 
+Timezone-aware `datetime` and `time` literals are rejected at the Predicate IR and QuerySpec
+boundaries. PyMySQL would otherwise discard their timezone and the Flight renderer would encode a
+different string contract. Query specifications redact SQL and every value from `repr`, exposing
+only positional parameter count, named parameter names, and Arrow schema.
+
 ## Splits
 
 ClickHouse splitting is available only for an explicitly allowlisted, non-replicated MergeTree
 physical engine whose complete active parts are observable from one server. ReplicatedMergeTree,
 SharedMergeTree, Distributed tables, views, and unknown engines fail closed to one task. Active
 `system.parts.partition_id` values are weighted by bytes and grouped under `target_tasks` and
-`max_tasks`; task SQL uses bound `_partition_id` values. The configured endpoint must pin planning
+`max_tasks`; task SQL uses bound `_partition_id` values. A real user column named `_partition_id`
+shadows the virtual column, so schema and `system.columns` checks force one task before any virtual
+partition predicate is generated. The configured endpoint must pin planning
 and every task query to that same physical server. The connector cannot detect a load balancer that
 routes physical-table queries across servers; such endpoints must use `split="single"` or a
 server-pinned address. Replica-aware discovery is outside v1.
@@ -49,6 +61,10 @@ Doris planning sends the projected, safely bound single-table SQL to FE `_query_
 response, and consumes only unique positive tablet IDs. Task SQL uses `TABLET(...)`. The Base64
 opaque plan is never executed because that would require an undocumented direct-BE scanner,
 authentication, topology, and lifecycle contract.
+
+An empty pruned tablet set is a successful zero-row plan, not a discovery failure. The connector
+emits one ordinary task with `LIMIT 0`; this preserves a concrete task/schema contract without
+turning an empty result into an unrestricted table scan.
 
 ## Count
 
@@ -96,6 +112,7 @@ suite verifies an unreachable endpoint terminates. Read-only Flight connections 
 autocommit and a one-batch ADBC result queue. PyMySQL and ADBC connections are closed only on their
 task-owned thread. If cancellation arrives during a blocking fetch, the close remains queued and
 runs when that call returns; repeated cancellation cannot cancel the close, and latency remains
-bounded by the configured driver timeout. Daft's upstream Python task bridge currently uses
+bounded by the configured driver timeout. A delayed close failure is logged only by its exception
+category; driver text is never logged. Daft's upstream Python task bridge currently uses
 unbounded producer/consumer channels, which an external source cannot retrofit with acknowledgements.
 This project documents that limitation and does not monkey patch or fork Daft.

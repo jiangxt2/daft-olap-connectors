@@ -37,12 +37,16 @@ class DiscoveryError(DaftOlapError):
     """Database metadata or split discovery failed."""
 
 
-class AuthenticationError(DiscoveryError):
+class AuthenticationError(DaftOlapError):
     """Database authentication failed."""
 
 
-class DatabasePermissionError(DiscoveryError):
+class DatabasePermissionError(DaftOlapError):
     """The database account lacks a required permission."""
+
+
+class DatabaseObjectNotFoundError(DaftOlapError):
+    """A requested database, table, or other database object does not exist."""
 
 
 class TransportError(DaftOlapError):

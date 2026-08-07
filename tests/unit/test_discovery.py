@@ -27,6 +27,7 @@ from daft_olap._common.contracts import ResourceLimits
 from daft_olap._common.errors import (
     AuthenticationError,
     ConfigurationError,
+    DatabaseObjectNotFoundError,
     DatabasePermissionError,
     DependencyError,
     DiscoveryError,
@@ -35,7 +36,67 @@ from daft_olap._common.errors import (
 from daft_olap._common.identifiers import QualifiedTable
 from daft_olap._common.redaction import SecretRef
 from daft_olap.clickhouse import discovery as clickhouse
+from daft_olap.clickhouse.errors import translate_clickhouse_error
 from daft_olap.doris import discovery as doris
+from daft_olap.doris.errors import translate_doris_error
+
+
+@pytest.mark.parametrize(
+    ("code", "name", "expected_type"),
+    [
+        (516, "AUTHENTICATION_FAILED", AuthenticationError),
+        (497, "ACCESS_DENIED", DatabasePermissionError),
+        (60, "UNKNOWN_TABLE", DatabaseObjectNotFoundError),
+    ],
+)
+def test_clickhouse_structured_errors_are_classified_without_driver_text(
+    code: int,
+    name: str,
+    expected_type: type[BaseException],
+) -> None:
+    error = RuntimeError("private driver text")
+    structured_error = cast(Any, error)
+    structured_error.code = code
+    structured_error.name = name
+    translated = translate_clickhouse_error(error, operation="test operation")
+    assert isinstance(translated, expected_type)
+    assert "private driver text" not in str(translated)
+    assert translate_clickhouse_error(RuntimeError("private"), operation="test") is None
+
+
+@pytest.mark.parametrize(
+    ("vendor_code", "status_code", "sqlstate", "expected_type"),
+    [
+        (1045, None, None, AuthenticationError),
+        (1142, None, None, DatabasePermissionError),
+        (1146, None, None, DatabaseObjectNotFoundError),
+        (None, 13, None, AuthenticationError),
+        (None, 14, None, DatabasePermissionError),
+        (None, 3, None, DatabaseObjectNotFoundError),
+        (None, None, "28000", AuthenticationError),
+    ],
+)
+def test_doris_structured_errors_are_classified_without_driver_text(
+    vendor_code: int | None,
+    status_code: int | None,
+    sqlstate: str | None,
+    expected_type: type[BaseException],
+) -> None:
+    error = RuntimeError(*(() if vendor_code is None else (vendor_code, "private text")))
+    structured_error = cast(Any, error)
+    structured_error.status_code = status_code
+    structured_error.sqlstate = sqlstate
+    translated = translate_doris_error(error, operation="test operation")
+    assert isinstance(translated, expected_type)
+    assert "private text" not in str(translated)
+
+
+def test_doris_generic_missing_object_error_is_classified_without_driver_text() -> None:
+    error = RuntimeError(1105, "errCode = 2, detailMessage = Unknown table 'private_table'")
+    translated = translate_doris_error(error, operation="schema discovery")
+    assert isinstance(translated, DatabaseObjectNotFoundError)
+    assert "private_table" not in str(translated)
+    assert translate_doris_error(RuntimeError(1105, "generic failure"), operation="test") is None
 
 
 class ClickHouseResult:
@@ -50,6 +111,7 @@ class FakeClickHouseClient:
         describe_rows: Sequence[Sequence[Any]] = (("id", "Int64"),),
         arrow_value: object | None = None,
         engine_rows: Sequence[Sequence[Any]] = (("MergeTree",),),
+        physical_partition_column_rows: Sequence[Sequence[Any]] = (),
         partition_rows: Sequence[Sequence[Any]] = (("p1", 10), ("p2", 5)),
         query_error: BaseException | None = None,
         close_error: BaseException | None = None,
@@ -59,6 +121,7 @@ class FakeClickHouseClient:
             pa.table({"id": pa.array([], type=pa.int64())}) if arrow_value is None else arrow_value
         )
         self.engine_rows = engine_rows
+        self.physical_partition_column_rows = physical_partition_column_rows
         self.partition_rows = partition_rows
         self.query_error = query_error
         self.close_error = close_error
@@ -73,6 +136,8 @@ class FakeClickHouseClient:
             return ClickHouseResult(self.describe_rows)
         if "system.tables" in sql:
             return ClickHouseResult(self.engine_rows)
+        if "system.columns" in sql:
+            return ClickHouseResult(self.physical_partition_column_rows)
         if "system.parts" in sql:
             return ClickHouseResult(self.partition_rows)
         raise AssertionError(f"unexpected query: {sql}")
@@ -144,6 +209,18 @@ def test_clickhouse_connection_validation_freezing_secret_and_kwargs(
                 secure=False,
                 settings=None,
                 client_options={managed_option: 1},
+            )
+    for managed_setting in ("max_block_size", "max_execution_time"):
+        with pytest.raises(ConfigurationError, match="managed option"):
+            clickhouse.ClickHouseConnection.from_options(
+                host="localhost",
+                database="analytics",
+                username="reader",
+                password="",
+                port=8123,
+                secure=False,
+                settings={managed_setting: 1},
+                client_options=None,
             )
 
 
@@ -226,7 +303,6 @@ def test_clickhouse_schema_discovery_fails_closed_and_closes(
 @pytest.mark.parametrize(
     ("engine_rows", "partition_rows", "supported", "partition_ids"),
     [
-        ((), (), False, ()),
         ((("View",),), (), False, ()),
         ((("MergeTree",),), (("p2", 5), ("p1", 10)), True, ("p2", "p1")),
         ((("ReplacingMergeTree",),), (("p1", 10),), True, ("p1",)),
@@ -252,6 +328,32 @@ def test_clickhouse_partition_discovery_engine_gate_and_metadata(
     assert result.supported is supported
     assert tuple(item.partition_id for item in result.partitions) == partition_ids
     assert client.closed
+
+
+def test_clickhouse_partition_discovery_distinguishes_missing_and_shadowing_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = FakeClickHouseClient(engine_rows=())
+    _install_clickhouse_client(monkeypatch, missing)
+    with pytest.raises(DatabaseObjectNotFoundError, match="not found"):
+        clickhouse.discover_partitions(
+            clickhouse.ClickHouseConnection(host="host", database="db"),
+            QualifiedTable("db", "missing"),
+            ResourceLimits(),
+        )
+
+    shadowed = FakeClickHouseClient(
+        physical_partition_column_rows=(("_partition_id",),),
+        partition_rows=(("must-not-be-read", 1),),
+    )
+    _install_clickhouse_client(monkeypatch, shadowed)
+    result = clickhouse.discover_partitions(
+        clickhouse.ClickHouseConnection(host="host", database="db"),
+        QualifiedTable("db", "events"),
+        ResourceLimits(),
+    )
+    assert not result.supported
+    assert not any("system.parts" in sql for sql, _ in shadowed.calls)
 
 
 def test_clickhouse_partition_discovery_rejects_bad_rows_and_hides_driver_errors(
@@ -599,12 +701,31 @@ def test_doris_discovery_reports_cleanup_failures_after_success(
     with pytest.raises(DiscoveryError, match="close") as discovery_error:
         doris._materialize_plan_sql(
             doris.DorisConnection(host="host", database="db"),
-            "SELECT 1",
-            (),
+            "SELECT %s",
+            (1,),
             ResourceLimits(),
         )
     assert "private connection close detail" not in str(discovery_error.value)
     assert cursor.closed and connection.closed
+
+
+def test_doris_plan_binding_without_parameters_does_not_open_mysql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doris,
+        "mysql_driver",
+        lambda: pytest.fail("parameterless planning SQL must not open MySQL"),
+    )
+    assert (
+        doris._materialize_plan_sql(
+            doris.DorisConnection(host="host", database="db"),
+            "SELECT 1",
+            (),
+            ResourceLimits(),
+        )
+        == "SELECT 1"
+    )
 
 
 @pytest.mark.parametrize("mogrified", [b"SELECT 7", "SELECT 7"])
@@ -649,6 +770,11 @@ def test_doris_plan_binding_accepts_driver_text_and_bytes(
             {"code": 0, "data": {"status": "1", "exception": "Access denied: table"}},
             DatabasePermissionError,
             "SELECT",
+        ),
+        (
+            {"code": 0, "data": {"status": "1", "exception": "Unknown table events"}},
+            DatabaseObjectNotFoundError,
+            "not found",
         ),
     ],
 )
@@ -770,6 +896,11 @@ def test_doris_tablet_discovery_bounds_query_plan_response(
             urllib.error.HTTPError("http://host", 401, "unauthorized", Message(), None),
             AuthenticationError,
             "credentials",
+        ),
+        (
+            urllib.error.HTTPError("http://host", 403, "forbidden", Message(), None),
+            DatabasePermissionError,
+            "denied",
         ),
         (
             urllib.error.HTTPError("http://host", 500, "failed", Message(), None),

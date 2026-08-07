@@ -23,6 +23,8 @@ from daft_olap._common.contracts import ResourceLimits, freeze_options
 from daft_olap._common.errors import (
     CompatibilityError,
     ConfigurationError,
+    DaftOlapError,
+    DatabaseObjectNotFoundError,
     DependencyError,
     DiscoveryError,
     SchemaError,
@@ -35,6 +37,7 @@ from daft_olap._common.redaction import (
     validate_secret,
 )
 from daft_olap._compat import validate_daft_arrow_schema
+from daft_olap.clickhouse.errors import translate_clickhouse_error
 from daft_olap.clickhouse.schema import (
     ClickHouseSchemaPlan,
     canonical_schema,
@@ -55,6 +58,10 @@ _RESERVED_CLIENT_OPTIONS = {
     "send_receive_timeout",
     "settings",
     "username",
+}
+_RESERVED_SETTINGS = {
+    "max_block_size",
+    "max_execution_time",
 }
 _MAX_PORT = 65_535
 _PARTITION_METADATA_COLUMNS = 2
@@ -122,7 +129,11 @@ class ClickHouseConnection:
             password=password,
             port=port,
             secure=secure,
-            settings=freeze_options(settings, reserved=set(), option_name="settings"),
+            settings=freeze_options(
+                settings,
+                reserved=_RESERVED_SETTINGS,
+                option_name="settings",
+            ),
             client_options=freeze_options(
                 client_options,
                 reserved=_RESERVED_CLIENT_OPTIONS,
@@ -172,6 +183,30 @@ class PartitionDiscovery:
     partitions: tuple[PartitionMetadata, ...] = ()
 
 
+def _table_engine(rows: list[tuple[Any, ...]]) -> str:
+    if not rows:
+        raise DatabaseObjectNotFoundError(
+            "ClickHouse table was not found during partition discovery"
+        )
+    if len(rows) != 1:
+        raise DiscoveryError("ClickHouse system.tables returned duplicate table metadata")
+    row = rows[0]
+    if len(row) != 1 or not isinstance(row[0], str):
+        raise DiscoveryError("ClickHouse system.tables returned malformed metadata")
+    return row[0]
+
+
+def _has_physical_partition_column(rows: list[tuple[Any, ...]]) -> bool:
+    if len(rows) > 1:
+        raise DiscoveryError("ClickHouse system.columns returned duplicate column metadata")
+    if not rows:
+        return False
+    row = rows[0]
+    if len(row) != 1 or row[0] != "_partition_id":
+        raise DiscoveryError("ClickHouse system.columns returned malformed metadata")
+    return True
+
+
 def _driver() -> Any:
     try:
         import clickhouse_connect
@@ -218,7 +253,10 @@ def discover_schema(
         failure = exc
         raise
     except Exception as exc:
-        failure = exc
+        translated = translate_clickhouse_error(exc, operation="schema discovery")
+        failure = translated or exc
+        if translated is not None:
+            raise translated from None
         raise SchemaError(
             f"failed to discover ClickHouse schema for {table.database!r}.{table.table!r}"
         ) from None
@@ -242,10 +280,16 @@ def discover_partitions(
             "SELECT engine FROM system.tables WHERE database = %(database)s AND name = %(table)s",
             parameters={"database": table.database, "table": table.table},
         )
-        if len(engine_result.result_rows) != 1:
+        engine = _table_engine(engine_result.result_rows)
+        if engine not in _LOCAL_MERGETREE_ENGINES:
             return PartitionDiscovery(False)
-        engine = engine_result.result_rows[0][0]
-        if not isinstance(engine, str) or engine not in _LOCAL_MERGETREE_ENGINES:
+        physical_partition_column = client.query(
+            "SELECT name FROM system.columns "
+            "WHERE database = %(database)s AND table = %(table)s "
+            "AND name = '_partition_id'",
+            parameters={"database": table.database, "table": table.table},
+        )
+        if _has_physical_partition_column(physical_partition_column.result_rows):
             return PartitionDiscovery(False)
         result = client.query(
             "SELECT partition_id, sum(bytes_on_disk) AS bytes_on_disk "
@@ -269,11 +313,14 @@ def discover_partitions(
         if len({partition.partition_id for partition in partitions}) != len(partitions):
             raise DiscoveryError("ClickHouse system.parts returned duplicate partition IDs")
         return PartitionDiscovery(True, tuple(partitions))
-    except (DependencyError, DiscoveryError) as exc:
+    except DaftOlapError as exc:
         failure = exc
         raise
     except Exception as exc:
-        failure = exc
+        translated = translate_clickhouse_error(exc, operation="partition discovery")
+        failure = translated or exc
+        if translated is not None:
+            raise translated from None
         raise DiscoveryError(
             f"failed to discover ClickHouse partitions for {table.database!r}.{table.table!r}"
         ) from None

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
@@ -28,6 +30,7 @@ from daft_olap._common.contracts import (
     ResourceLimits,
     SplitMode,
     group_weighted_items,
+    validate_query_parameter_values,
 )
 from daft_olap._common.errors import CompatibilityError, ConfigurationError, DiscoveryError
 from daft_olap._common.identifiers import QualifiedTable
@@ -52,6 +55,8 @@ from daft_olap.clickhouse.task import ClickHouseTask
 
 PartitionDiscoverer = Callable[[], PartitionDiscovery]
 ClickHouseTaskFactory = Callable[[ClickHouseConnection, QuerySpec, ResourceLimits], DataSourceTask]
+
+logger = logging.getLogger(__name__)
 
 
 class ClickHouseDataSource(DataSource):
@@ -94,6 +99,7 @@ class ClickHouseDataSource(DataSource):
         parameters = tuple((query_parameters or {}).items())
         if any(not isinstance(key, str) or not key for key, _ in parameters):
             raise ConfigurationError("query parameter names must be non-empty strings")
+        validate_query_parameter_values(value for _, value in parameters)
         self._table = QualifiedTable(database, table)
         self._limits = ResourceLimits(
             batch_rows=batch_rows,
@@ -138,18 +144,36 @@ class ClickHouseDataSource(DataSource):
     def supports_count_pushdown(self) -> bool:
         return count_pushdown_available()
 
-    def _partition_groups(self, limit: int | None) -> tuple[tuple[str, ...] | None, ...]:
+    async def _partition_groups(self, limit: int | None) -> tuple[tuple[str, ...] | None, ...]:
         if self._split == "single" or limit == 0:
             return (None,)
-        try:
-            discovery = (
-                self._partition_discoverer()
-                if self._partition_discoverer is not None
-                else discover_partitions(self._connection, self._table, self._limits)
+        if "_partition_id" in self._arrow_schema.names:
+            logger.warning(
+                "ClickHouse table %r.%r has a physical _partition_id column; "
+                "falling back to one task",
+                self._table.database,
+                self._table.table,
             )
-        except DiscoveryError:
+            return (None,)
+        try:
+            if self._partition_discoverer is not None:
+                discovery = await asyncio.to_thread(self._partition_discoverer)
+            else:
+                discovery = await asyncio.to_thread(
+                    discover_partitions,
+                    self._connection,
+                    self._table,
+                    self._limits,
+                )
+        except DiscoveryError as error:
             if self._discovery_policy == "error":
                 raise
+            logger.warning(
+                "ClickHouse partition discovery failed for %r.%r (%s); falling back to one task",
+                self._table.database,
+                self._table.table,
+                type(error).__name__,
+            )
             return (None,)
         if not discovery.supported or not discovery.partitions:
             return (None,)
@@ -189,7 +213,7 @@ class ClickHouseDataSource(DataSource):
         task_schema = project_schema(self._arrow_schema, columns)
         predicate = compile_filter(pushdowns.filters)
         database_limit = safe_database_limit(pushdowns, predicate)
-        for partition_ids in self._partition_groups(database_limit):
+        for partition_ids in await self._partition_groups(database_limit):
             sql, parameters = build_select(
                 table=self._table,
                 columns=columns,

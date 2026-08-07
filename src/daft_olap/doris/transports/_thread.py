@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypeVar
 
 _T = TypeVar("_T")
+logger = logging.getLogger(__name__)
 
 
 class TaskThread:
@@ -44,5 +46,10 @@ class TaskThread:
 
     def _shutdown(self, _future: asyncio.Future[None]) -> None:
         if not _future.cancelled():
-            _future.exception()
+            failure = _future.exception()
+            if failure is not None:
+                logger.warning(
+                    "Doris task-thread resource close failed (%s)",
+                    type(failure).__name__,
+                )
         self._executor.shutdown(wait=False, cancel_futures=False)
