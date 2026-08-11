@@ -12,19 +12,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socketserver
 import subprocess
 import sys
 import textwrap
-from collections.abc import AsyncIterator
+import threading
+import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import daft
 import pyarrow as pa
+import pymysql
 import pytest
 import ray
 from daft.exceptions import DaftCoreException
@@ -47,10 +54,13 @@ from daft_olap.doris.discovery import DorisConnection, discover_tablets
 from daft_olap.doris.sql import build_select
 from daft_olap.doris.task import DorisTask, DorisTransport
 from daft_olap.doris.transports.flight import stream_query as stream_flight
+from daft_olap.doris.transports.mysql import MySqlBatchReader
 from daft_olap.doris.transports.mysql import stream_query as stream_mysql
 
 pytestmark = pytest.mark.integration
 _PROBE_PATH_ENV = "DAFT_OLAP_IT_TASK_PROBE"
+_LOCAL_CONNECT_TIMEOUT_SECONDS = 1.0
+_FLIGHT_CONNECT_MAX_SECONDS = 8.0
 
 
 def _record_task(query: QuerySpec, transport: DorisTransport) -> None:
@@ -113,12 +123,56 @@ def _flight_port() -> int:
     return int(os.environ.get("DORIS_FLIGHT_PORT", "28070"))
 
 
+class _PlanningStallServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    phase: str
+    release: threading.Event
+
+
+class _PlanningStallHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        server = cast(_PlanningStallServer, self.server)
+        self.request.recv(64 * 1024)
+        if server.phase == "body":
+            self.request.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b'Content-Length: 128\r\nConnection: close\r\n\r\n{"code":'
+            )
+        server.release.wait(timeout=5)
+
+
+@contextmanager
+def _planning_stall(phase: str) -> Iterator[int]:
+    release = threading.Event()
+    with _PlanningStallServer(("127.0.0.1", 0), _PlanningStallHandler) as server:
+        server.phase = phase
+        server.release = release
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield int(server.server_address[1])
+        finally:
+            release.set()
+            server.shutdown()
+            thread.join(timeout=2)
+
+
+def _mysql_task_threads() -> set[threading.Thread]:
+    return {
+        thread for thread in threading.enumerate() if thread.name.startswith("daft-doris-mysql")
+    }
+
+
 def _source(
     *,
     transport: str = "mysql",
     split: str = "single",
     http_port: int | None = None,
     table: str = "events",
+    discovery_policy: str = "single",
+    planning_timeout_seconds: float = 10.0,
 ) -> DorisDataSource:
     return DorisDataSource(
         host="127.0.0.1",
@@ -131,6 +185,9 @@ def _source(
         table=table,
         transport=transport,
         split=split,
+        discovery_policy=cast(Any, discovery_policy),
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
+        planning_timeout_seconds=planning_timeout_seconds,
         batch_rows=2,
         target_tasks=4,
         max_tasks=4,
@@ -149,6 +206,7 @@ def test_projection_filter_limit_count_nulls_and_repeat_collect(transport: str) 
         database="analytics",
         table="events",
         transport=transport,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         columns=("id", "kind"),
         filter=daft.col("score") >= 25,
         batch_rows=2,
@@ -175,6 +233,7 @@ def test_residual_filter_runs_before_global_limit(transport: str) -> None:
         database="analytics",
         table="events",
         transport=transport,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         columns=("id",),
         filter=daft.functions.length(daft.col("kind")) > 4,
         split="auto",
@@ -201,6 +260,14 @@ def test_mysql_and_flight_common_type_results_agree() -> None:
     mysql = _source(transport="mysql", split="single").read().select(*columns).sort("id")
     flight = _source(transport="flight", split="single").read().select(*columns).sort("id")
     assert flight.to_arrow() == mysql.to_arrow()
+
+
+def test_flight_connect_timeout_bounds_database_open() -> None:
+    started = time.monotonic()
+    result = _source(transport="flight", split="single").read().select("id").limit(1).to_pydict()
+    elapsed = time.monotonic() - started
+    assert len(result["id"]) == 1
+    assert elapsed < _FLIGHT_CONNECT_MAX_SECONDS
 
 
 @pytest.mark.parametrize("transport", ["mysql", "flight"])
@@ -247,6 +314,7 @@ def test_trusted_filter_uses_selected_transport_binding(transport: str) -> None:
         database="analytics",
         table="events",
         transport=transport,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         split="single",
         unsafe_where_sql="score >= :minimum AND kind != :excluded",
         query_parameters={"minimum": 25, "excluded": "gamma"},
@@ -261,6 +329,7 @@ def test_trusted_filter_uses_selected_transport_binding(transport: str) -> None:
         database="analytics",
         table="events",
         transport=transport,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         split="single",
         unsafe_where_sql="kind = :kind",
         query_parameters={"kind": "missing' OR TRUE --"},
@@ -278,6 +347,7 @@ def test_literal_percent_with_bound_values_uses_selected_transport(transport: st
         database="analytics",
         table="events",
         transport=transport,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         split="auto",
         unsafe_where_sql="kind LIKE 'a%' AND score >= :minimum",
         query_parameters={"minimum": 25},
@@ -296,6 +366,7 @@ async def test_empty_fe_pruning_emits_and_executes_one_limit_zero_task(transport
         database="analytics",
         table="events",
         transport=transport,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         split="auto",
         unsafe_where_sql="FALSE",
     )
@@ -379,6 +450,7 @@ async def test_query_plan_returns_tablets_and_strict_discovery_does_not_fallback
         database="analytics",
         table="events",
         transport="mysql",
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         split="auto",
     )
     with pytest.raises(DatabasePermissionError):
@@ -394,11 +466,38 @@ async def test_query_plan_returns_tablets_and_strict_discovery_does_not_fallback
         database="analytics",
         table="events",
         transport="mysql",
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         split="auto",
         discovery_policy="error",
     )
     with pytest.raises(DiscoveryError):
         strict.read().select("id").to_pydict()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["header", "body"])
+async def test_planning_io_timeout_is_strict_or_one_task_fallback(phase: str) -> None:
+    with _planning_stall(phase) as http_port:
+        strict = _source(
+            split="auto",
+            http_port=http_port,
+            discovery_policy="error",
+            planning_timeout_seconds=0.2,
+        )
+        with pytest.raises(DiscoveryError) as captured:
+            _ = [task async for task in strict.get_tasks(Pushdowns())]
+        assert str(captured.value) == "Doris query-plan request timed out"
+
+        fallback = _source(
+            split="auto",
+            http_port=http_port,
+            discovery_policy="single",
+            planning_timeout_seconds=0.2,
+        )
+        tasks = [task async for task in fallback.get_tasks(Pushdowns())]
+        assert len(tasks) == 1
+        assert isinstance(tasks[0], DorisTask)
+        assert "TABLET(" not in tasks[0]._query.sql
 
 
 @pytest.mark.asyncio
@@ -416,14 +515,18 @@ async def test_real_transport_is_multibatch_and_can_close_early(transport: str) 
         arrow_schema=pa.schema([("id", pa.int64()), ("payload", pa.string())]),
     )
     factory = stream_mysql if transport == "mysql" else stream_flight
-    stream: AsyncIterator[pa.RecordBatch] = factory(connection, query, ResourceLimits(batch_rows=2))
+    limits = ResourceLimits(
+        batch_rows=2,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
+    )
+    stream: AsyncIterator[pa.RecordBatch] = factory(connection, query, limits)
     first = await anext(stream)
     assert 0 < first.num_rows <= 2
     await stream.aclose()
 
     row_count = 0
     batch_count = 0
-    async for batch in factory(connection, query, ResourceLimits(batch_rows=2)):
+    async for batch in factory(connection, query, limits):
         assert 0 < batch.num_rows <= 2
         row_count += batch.num_rows
         batch_count += 1
@@ -439,11 +542,71 @@ async def test_real_transport_is_multibatch_and_can_close_early(transport: str) 
         async for batch in factory(
             connection,
             wide_query,
-            ResourceLimits(batch_rows=8, batch_bytes=9_000),
+            ResourceLimits(
+                batch_rows=8,
+                batch_bytes=9_000,
+                connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
+            ),
         )
     ]
     assert sum(batch.num_rows for batch in wide_batches) == 8
     assert all(batch.nbytes <= 9_000 or batch.num_rows == 1 for batch in wide_batches)
+
+
+@pytest.mark.asyncio
+async def test_real_pymysql_early_close_never_drains_and_reclaims_its_task_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert version("PyMySQL") == "1.2.0"
+    drain_calls: list[bool] = []
+
+    def forbidden_drain(result: object) -> None:
+        drain_calls.append(True)
+        raise AssertionError("PyMySQL unbuffered drain must not run")
+
+    monkeypatch.setattr(
+        pymysql.connections.MySQLResult,
+        "_finish_unbuffered_query",
+        forbidden_drain,
+    )
+    connections: list[Any] = []
+
+    def connect(**kwargs: Any) -> Any:
+        connection = pymysql.connect(**kwargs)
+        connections.append(connection)
+        return connection
+
+    baseline_threads = _mysql_task_threads()
+    reader = MySqlBatchReader(
+        DorisConnection(
+            host="127.0.0.1",
+            mysql_port=_mysql_port(),
+            database="analytics",
+            password=os.environ.get("DORIS_PASSWORD", ""),
+        ),
+        QuerySpec(
+            sql=(
+                "SELECT e1.id FROM analytics.events e1 "
+                "CROSS JOIN analytics.events e2 CROSS JOIN analytics.events e3 "
+                "CROSS JOIN analytics.events e4 CROSS JOIN analytics.events e5"
+            ),
+            arrow_schema=pa.schema([("id", pa.int64())]),
+        ),
+        ResourceLimits(batch_rows=2),
+        connection_factory=connect,
+    )
+    await reader.start()
+    try:
+        first = await reader.next_batch()
+        assert first is not None and first.num_rows == 2
+    finally:
+        await reader.close()
+
+    assert drain_calls == []
+    assert len(connections) == 1 and not connections[0].open
+    for thread in _mysql_task_threads() - baseline_threads:
+        await asyncio.to_thread(thread.join, 5)
+    assert _mysql_task_threads() <= baseline_threads
 
 
 def test_bad_doris_credentials_fail_closed_without_secret_disclosure() -> None:
@@ -459,6 +622,7 @@ def test_bad_doris_credentials_fail_closed_without_secret_disclosure() -> None:
             database="analytics",
             table="events",
             transport="mysql",
+            connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         )
     assert secret not in str(error.value)
 
@@ -478,7 +642,7 @@ def test_flight_failure_never_falls_back_to_mysql() -> None:
         table="events",
         transport="flight",
         split="single",
-        connect_timeout_seconds=1,
+        connect_timeout_seconds=_LOCAL_CONNECT_TIMEOUT_SECONDS,
         query_timeout_seconds=1,
     )
     with pytest.raises(DaftCoreException, match="Doris Flight query failed"):
@@ -516,6 +680,7 @@ def test_real_doris_tablet_tasks_coexist_with_ray_data_on_multinode_cluster(tmp_
                     database="analytics",
                     table="events",
                     transport=transport,
+                    connect_timeout_seconds=1.0,
                     split="auto",
                     batch_rows=2,
                     target_tasks=4,

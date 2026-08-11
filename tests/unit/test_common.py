@@ -31,6 +31,7 @@ from daft_olap._common.contracts import (
     group_adjacent_ids,
     group_weighted_items,
     iter_batch_slices,
+    validate_timeout_seconds,
 )
 from daft_olap._common.errors import ConfigurationError, DaftOlapError
 from daft_olap._common.identifiers import (
@@ -127,6 +128,23 @@ def test_resource_limits_enforce_task_and_batch_caps() -> None:
         ResourceLimits(target_tasks=3, max_tasks=2)
     with pytest.raises(ConfigurationError, match="batch_rows"):
         ResourceLimits(batch_rows=0)
+
+
+@pytest.mark.parametrize("value", [1, 1.5, 86_400])
+def test_shared_timeout_validator_accepts_finite_positive_bounds(value: int | float) -> None:
+    assert validate_timeout_seconds("planning_timeout_seconds", value) == float(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 0, -1, float("nan"), float("inf"), 86_401, "10", object()],
+)
+def test_shared_timeout_validator_rejects_invalid_values_without_echoing_them(
+    value: object,
+) -> None:
+    with pytest.raises(ConfigurationError) as captured:
+        validate_timeout_seconds("planning_timeout_seconds", value)
+    assert str(captured.value) == ("planning_timeout_seconds must be between 0 and 86,400 seconds")
 
 
 def test_freeze_options_copies_and_rejects_reserved_keys() -> None:

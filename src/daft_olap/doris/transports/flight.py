@@ -23,7 +23,7 @@ import pyarrow as pa
 from daft_olap._common.contracts import QuerySpec, ResourceLimits, iter_batch_slices
 from daft_olap._common.errors import DaftOlapError, DependencyError, SchemaError, TransportError
 from daft_olap._common.redaction import resolve_secret
-from daft_olap.doris.discovery import DorisConnection
+from daft_olap.doris.discovery import ADBC_FLIGHT_CONNECT_TIMEOUT_OPTION, DorisConnection
 from daft_olap.doris.errors import translate_doris_error
 from daft_olap.doris.transports._thread import TaskThread
 
@@ -94,6 +94,7 @@ class FlightBatchReader:
         db_kwargs = {
             database_options.USERNAME.value: self._config.username,
             database_options.PASSWORD.value: resolve_secret(self._config.password),
+            ADBC_FLIGHT_CONNECT_TIMEOUT_OPTION: str(self._limits.connect_timeout_seconds),
             flight_options.TIMEOUT_QUERY.value: timeout,
             flight_options.TIMEOUT_FETCH.value: timeout,
             flight_options.WITH_BLOCK.value: "false",

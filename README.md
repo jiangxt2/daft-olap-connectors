@@ -94,6 +94,14 @@ executed. For encrypted endpoints, set `http_secure=True` with the FE HTTPS port
 `flight_secure=True` with a TLS-enabled Flight endpoint; certificate options remain explicit in
 `mysql_options` and `flight_options`.
 
+`planning_timeout_seconds` defaults to 10 seconds and applies only to each blocking FE
+`_query_plan` HTTP(S) connect, response-header, or response-body socket operation. It is not an
+end-to-end planning deadline: a peer that keeps making progress may take longer overall.
+`connect_timeout_seconds` controls MySQL and Flight connection establishment, while
+`query_timeout_seconds` controls MySQL read/write and Flight query/fetch operations. Flight passes
+the connection budget through ADBC's database-level connect RPC option. The default `split="single"`
+path never calls `_query_plan`.
+
 ## Safe filters and trusted SQL
 
 Use Daft expressions for business filters. Supported comparisons, boolean operations, NULL tests,

@@ -599,6 +599,7 @@ def test_public_read_apis_construct_lazy_sources_then_apply_filter_and_projectio
         transport="flight",
         http_secure=True,
         flight_secure=True,
+        planning_timeout_seconds=4.5,
         columns=("id", "kind"),
         filter=expression,
     )
@@ -609,6 +610,7 @@ def test_public_read_apis_construct_lazy_sources_then_apply_filter_and_projectio
     assert FakeSource.last_options["flight_secure"] is True
     assert FakeSource.last_options["split"] == "single"
     assert FakeSource.last_options["batch_bytes"] == 64 * 1024 * 1024
+    assert FakeSource.last_options["planning_timeout_seconds"] == 4.5
 
 
 def test_public_read_apis_leave_unrequested_operations_out_of_plan(

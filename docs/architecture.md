@@ -17,6 +17,7 @@ Network-backed split discovery is awaited from `get_tasks()` through a worker th
 ClickHouse metadata, PyMySQL binding, and Doris FE HTTP calls do not block Daft's async planning
 loop. Planning still completes before tasks are emitted and its latency remains part of DataSource
 planning. A parameterless Doris planning query bypasses the temporary PyMySQL binding connection.
+Doris FE planning has its own timeout, separate from MySQL connection and query timeouts.
 
 Workers create one selected transport per task:
 
@@ -68,9 +69,11 @@ routes physical-table queries across servers; such endpoints must use `split="si
 server-pinned address. Replica-aware discovery is outside v1.
 
 Doris automatic planning sends the projected, safely bound single-table SQL to FE `_query_plan`,
-validates the response, and consumes only unique positive tablet IDs. Task SQL uses `TABLET(...)`. The Base64
-opaque plan is never executed because that would require an undocumented direct-BE scanner,
-authentication, topology, and lifecycle contract.
+validates the response, and consumes only unique positive tablet IDs. Its planning timeout applies
+to each blocking HTTP(S) connection, response-header, and response-body socket operation rather
+than imposing a cumulative wall-clock deadline. Task SQL uses `TABLET(...)`. The Base64 opaque plan
+is never executed because that would require an undocumented direct-BE scanner, authentication,
+topology, and lifecycle contract.
 
 An empty pruned tablet set is a successful zero-row plan, not a discovery failure. The connector
 emits one ordinary task with `LIMIT 0`; this preserves a concrete task/schema contract without
@@ -112,17 +115,26 @@ per endpoint; Doris controls how many
 endpoints a query returns, so endpoint count remains outside the connector-side bound while the
 pinned server behavior is exercised by integration tests. Doris FE query-plan responses are read
 with a 16 MiB hard limit so an opaque plan or malformed metadata response cannot cause unbounded
-driver-side buffering.
+driver-side buffering. Direct and URL-wrapped planning timeouts share one sanitized discovery
+category; other network failures remain unavailable-endpoint errors.
 
-ADBC Flight SQL 1.12.0 exposes query and fetch RPC timeouts but no separate Python connect-timeout
-option. Connection work runs on the task-dedicated thread; the connector sets `WITH_BLOCK=false`
-for compatible driver versions, while current ADBC documentation marks that option as a no-op. The
-configured query timeout applies to the first query RPC and every result fetch, and the real failure
-suite verifies an unreachable endpoint terminates. Read-only Flight connections explicitly use
-autocommit and a one-batch ADBC result queue. PyMySQL and ADBC connections are closed only on their
-task-owned thread. If cancellation arrives during a blocking fetch, the close remains queued and
-runs when that call returns; repeated cancellation cannot cancel the close, and latency remains
-bounded by the configured driver timeout. A delayed close failure is logged only by its exception
-category; driver text is never logged. Daft's upstream Python task bridge currently uses
+ADBC Flight SQL 1.12.0 exposes query and fetch RPC timeouts through Python enums but does not expose
+its documented database-level connect timeout as an enum member. The connector therefore maps
+`connect_timeout_seconds` to the official raw
+`adbc.flight.sql.rpc.timeout_seconds.connect` database option. Connection work runs on the
+task-dedicated thread; the connector sets `WITH_BLOCK=false` for compatible driver versions, while
+current ADBC documentation marks that option as a no-op. The configured query timeout applies to the
+first query RPC and every result fetch, and the real failure suite verifies an unreachable endpoint
+terminates. Read-only Flight connections explicitly use autocommit and a one-batch ADBC result queue.
+PyMySQL and ADBC connections are closed only on their task-owned thread. The PyMySQL compatibility
+layer validates the SSCursor/result reference shape
+before delivering a batch. At normal EOF it uses the public cursor close path; on an active early
+stop it closes the task-owned connection first, marks the validated result inactive, detaches
+result/cursor connection references, and only then closes the cursor. This prevents PyMySQL's
+unbuffered cursor close from draining unread rows and fails closed if the allowed private shape is
+missing or contradictory. If cancellation arrives during a blocking fetch, the close remains
+queued and runs when that call returns; repeated cancellation cannot cancel the close, and latency
+remains bounded by the configured driver timeout. A delayed close failure is logged only by its
+exception category; driver text is never logged. Daft's upstream Python task bridge currently uses
 unbounded producer/consumer channels, which an external source cannot retrofit with acknowledgements.
 This project documents that limitation and does not monkey patch or fork Daft.

@@ -167,18 +167,42 @@ def test_doris_rejects_unserializable_options_before_schema_discovery(
         )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [True, 0, -1, float("nan"), float("inf"), 86_401, "10"],
+)
+def test_doris_rejects_invalid_planning_timeout_before_schema_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    monkeypatch.setattr(
+        "daft_olap.doris.datasource.discover_schema",
+        lambda *args, **kwargs: pytest.fail("schema discovery must not run"),
+    )
+    with pytest.raises(ConfigurationError, match="planning_timeout_seconds"):
+        DorisDataSource(
+            host="localhost",
+            database="analytics",
+            table="events",
+            transport="mysql",
+            planning_timeout_seconds=cast(Any, value),
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["mysql", "flight"])
 async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
     transport: DorisTransport,
 ) -> None:
-    planning_calls: list[tuple[str, tuple[object, ...]]] = []
+    planning_calls: list[tuple[str, tuple[object, ...], float]] = []
     planning_thread: int | None = None
 
-    def discover(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+    def discover(
+        sql: str, parameters: tuple[object, ...], planning_timeout_seconds: float
+    ) -> tuple[int, ...]:
         nonlocal planning_thread
         planning_thread = threading.get_ident()
-        planning_calls.append((sql, parameters))
+        planning_calls.append((sql, parameters, planning_timeout_seconds))
         return (4, 2, 3, 1)
 
     event_loop_thread = threading.get_ident()
@@ -191,6 +215,7 @@ async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
         split="auto",
         target_tasks=2,
         max_tasks=2,
+        planning_timeout_seconds=7.5,
         _arrow_schema=SCHEMA,
         _tablet_discoverer=discover,
     )
@@ -208,6 +233,7 @@ async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
     assert all(task.schema.column_names() == ["kind", "score"] for task in doris_tasks)
     assert planning_calls[0][0].count("TABLET") == 0
     assert "%s" in planning_calls[0][0]
+    assert planning_calls[0][2] == 7.5
     assert "secret-value" not in repr(source)
     pickle.loads(pickle.dumps(tasks[0]))
 
@@ -218,7 +244,9 @@ async def test_doris_discovery_policy_warns_only_for_single_task_fallback(
 ) -> None:
     secret = "must-not-be-logged"
 
-    def fail_discovery(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+    def fail_discovery(
+        sql: str, parameters: tuple[object, ...], planning_timeout_seconds: float
+    ) -> tuple[int, ...]:
         raise DiscoveryError(f"driver detail: {secret}")
 
     source = DorisDataSource(
@@ -271,7 +299,7 @@ async def test_doris_empty_tablet_pruning_emits_one_limit_zero_task() -> None:
         transport="mysql",
         split="auto",
         _arrow_schema=SCHEMA,
-        _tablet_discoverer=lambda sql, parameters: (),
+        _tablet_discoverer=lambda sql, parameters, planning_timeout_seconds: (),
     )
     tasks = [cast(DorisTask, task) async for task in source.get_tasks(Pushdowns())]
     assert len(tasks) == 1
@@ -291,7 +319,9 @@ async def test_doris_empty_tablet_pruning_emits_one_limit_zero_task() -> None:
 async def test_doris_nonrecoverable_discovery_errors_never_fall_back(
     failure: BaseException,
 ) -> None:
-    def fail_discovery(sql: str, parameters: tuple[object, ...]) -> tuple[int, ...]:
+    def fail_discovery(
+        sql: str, parameters: tuple[object, ...], planning_timeout_seconds: float
+    ) -> tuple[int, ...]:
         raise failure
 
     source = DorisDataSource(
@@ -349,7 +379,9 @@ async def test_doris_count_honors_negotiated_daft_capability() -> None:
         transport="flight",
         split="auto",
         _arrow_schema=SCHEMA,
-        _tablet_discoverer=lambda sql, parameters: pytest.fail("count must not discover tablets"),
+        _tablet_discoverer=lambda sql, parameters, planning_timeout_seconds: pytest.fail(
+            "count must not discover tablets"
+        ),
     )
     count_pushdowns = Pushdowns(aggregation=daft.col("id").count("all"))
     if not source.supports_count_pushdown():
@@ -377,7 +409,7 @@ async def test_doris_default_single_snapshots_nested_query_parameters() -> None:
         unsafe_where_sql="id IN :ids",
         query_parameters={"ids": ids},
         _arrow_schema=SCHEMA,
-        _tablet_discoverer=lambda sql, parameters: pytest.fail(
+        _tablet_discoverer=lambda sql, parameters, planning_timeout_seconds: pytest.fail(
             "default single must not discover tablets"
         ),
     )

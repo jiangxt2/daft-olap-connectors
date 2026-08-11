@@ -102,21 +102,33 @@ class FakeMySqlCursor:
         self.description = (("id",), ("active",))
         self._rows = rows
         self._events = events
-        self._result = SimpleNamespace(unbuffered_active=True, connection=object())
+        self.connection: FakeMySqlConnection | None = None
+        self._result: Any = None
         self.closed = False
 
     def execute(self, sql: str, parameters: tuple[Any, ...] | None) -> None:
         self._events.append(("execute", threading.get_ident()))
         assert sql == "SELECT id, active FROM events"
         assert parameters is None
+        result = SimpleNamespace(unbuffered_active=True, connection=self.connection)
+        self._result = result
+        assert self.connection is not None
+        self.connection._result = result
 
     def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
         self._events.append(("fetch", threading.get_ident()))
         batch, self._rows = self._rows[:size], self._rows[size:]
+        if len(batch) < size:
+            self._result.unbuffered_active = False
+            self._result.connection = None
         return batch
 
     def close(self) -> None:
         self._events.append(("cursor_close", threading.get_ident()))
+        if self.connection is not None and self._result.unbuffered_active:
+            self._events.append(("drain", threading.get_ident()))
+            raise AssertionError("unbuffered drain must not run")
+        self.connection = None
         self.closed = True
 
 
@@ -124,7 +136,9 @@ class FakeMySqlConnection:
     def __init__(self, cursor: FakeMySqlCursor, events: list[tuple[str, int]]) -> None:
         self._cursor = cursor
         self._events = events
+        self._result: Any = None
         self.closed = False
+        cursor.connection = self
 
     def cursor(self) -> FakeMySqlCursor:
         self._events.append(("cursor", threading.get_ident()))
@@ -160,6 +174,7 @@ async def test_mysql_reader_is_demand_driven_single_threaded_and_closes_early() 
     assert cursor.closed and connection.closed
     assert cursor._result.unbuffered_active is False
     assert cursor._result.connection is None
+    assert "drain" not in [name for name, _ in events]
     event_names = [name for name, _ in events]
     assert event_names.index("connection_close") < event_names.index("cursor_close")
     worker_threads = {thread_id for _, thread_id in events}
@@ -179,6 +194,8 @@ async def test_mysql_blocked_fetch_and_repeated_cancellation_still_close_on_owne
             events.append(("fetch", threading.get_ident()))
             fetch_started.set()
             assert release_fetch.wait(timeout=2)
+            self._result.unbuffered_active = False
+            self._result.connection = None
             return []
 
     class BlockingConnection(FakeMySqlConnection):
@@ -321,11 +338,16 @@ async def test_flight_reader_has_queue_cap_timeout_and_single_thread_lifecycle(
             sql="SELECT id FROM events",
             arrow_schema=pa.schema([("id", pa.int64())]),
         ),
-        ResourceLimits(batch_rows=2, query_timeout_seconds=12),
+        ResourceLimits(
+            batch_rows=2,
+            connect_timeout_seconds=3,
+            query_timeout_seconds=12,
+        ),
         connection_factory=connect,
     )
     await reader.start()
     assert cursor.adbc_statement.options == {"adbc.rpc.result_queue_size": "1"}
+    assert captured["db_kwargs"]["adbc.flight.sql.rpc.timeout_seconds.connect"] == "3"
     assert captured["db_kwargs"]["adbc.flight.sql.rpc.timeout_seconds.query"] == "12"
     assert captured["db_kwargs"]["adbc.flight.sql.rpc.timeout_seconds.fetch"] == "12"
     assert captured["db_kwargs"]["adbc.flight.sql.client_option.with_block"] == "false"

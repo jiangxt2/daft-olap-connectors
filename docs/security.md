@@ -22,7 +22,8 @@ accepted as configuration values. Private test factories are not serialized into
 
 Public exception categories and Daft/Ray wrapping behavior are specified in the
 [error contract](errors.md). Cancellation is preserved as `asyncio.CancelledError`; sanitized
-timeout failures never include driver URLs or parameter values.
+planning timeout and PyMySQL capability failures never include request URLs, hosts, SQL, parameter
+values, credentials, object representations, or underlying exception text.
 
 ## SQL construction
 

@@ -36,11 +36,19 @@ to connector exceptions. A driver timeout is not cancellation: it is reported as
 phase-specific `SchemaError`, `DiscoveryError`, or `TransportError`, because the supported drivers
 do not expose one portable timeout exception hierarchy.
 
+Doris FE `_query_plan` uses `planning_timeout_seconds`, independently of worker query timeouts. A
+direct socket timeout while connecting, waiting for response headers, or reading the body, and a
+timeout wrapped by `urllib.error.URLError`, become the same sanitized `DiscoveryError` stating that
+query planning timed out. The timeout is per blocking socket operation, not a cumulative deadline.
+With `discovery_policy="error"` it propagates; with `"single"` it may select one ordinary task under
+the same warning and redaction rules as other recoverable discovery failures. `split="single"`
+does not contact the planning endpoint.
+
 Doris synchronous driver calls run on a task-owned thread. Cancellation stops awaiting the active
 fetch but cannot safely interrupt PyMySQL or ADBC from another thread. The already submitted close
-operation remains queued on the owner thread and runs after the driver call returns. Cancellation
-latency is therefore bounded by the configured driver query/socket timeout, not by immediate
-cross-thread connection closure.
+operation remains queued on the owner thread and runs after the driver call returns. Connection
+establishment uses `connect_timeout_seconds`; query and fetch cancellation latency is bounded by the
+configured driver query/socket timeout, not by immediate cross-thread connection closure.
 
 ## Daft and Ray wrapping
 
