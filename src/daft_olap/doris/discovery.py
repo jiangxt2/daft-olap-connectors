@@ -26,7 +26,12 @@ from typing import Any
 
 import pyarrow as pa
 
-from daft_olap._common.contracts import ResourceLimits, freeze_options, thaw_options
+from daft_olap._common.contracts import (
+    ResourceLimits,
+    freeze_options,
+    thaw_options,
+    validate_timeout_seconds,
+)
 from daft_olap._common.errors import (
     AuthenticationError,
     CompatibilityError,
@@ -72,7 +77,9 @@ _RESERVED_MYSQL_OPTIONS = {
     "user",
     "write_timeout",
 }
+ADBC_FLIGHT_CONNECT_TIMEOUT_OPTION = "adbc.flight.sql.rpc.timeout_seconds.connect"
 _RESERVED_FLIGHT_OPTIONS = {
+    ADBC_FLIGHT_CONNECT_TIMEOUT_OPTION,
     "adbc.flight.sql.client_option.with_block",
     "adbc.flight.sql.rpc.timeout_seconds.fetch",
     "adbc.flight.sql.rpc.timeout_seconds.query",
@@ -100,8 +107,8 @@ _QUERY_PLAN_OPENER = urllib.request.build_opener(
 )
 
 
-def _open_query_plan(request: urllib.request.Request, timeout: float) -> Any:
-    return _QUERY_PLAN_OPENER.open(request, timeout=timeout)
+def _open_query_plan(request: urllib.request.Request, planning_timeout_seconds: float) -> Any:
+    return _QUERY_PLAN_OPENER.open(request, timeout=planning_timeout_seconds)
 
 
 @dataclass(frozen=True)
@@ -383,8 +390,13 @@ def discover_tablets(
     sql: str,
     parameters: tuple[Any, ...],
     limits: ResourceLimits,
+    *,
+    planning_timeout_seconds: float = 10.0,
 ) -> tuple[int, ...]:
     """Call FE's SELECT-authorized `_query_plan` endpoint and return pruned tablet IDs."""
+    planning_timeout_seconds = validate_timeout_seconds(
+        "planning_timeout_seconds", planning_timeout_seconds
+    )
     rendered_sql = _materialize_plan_sql(connection, sql, parameters, limits)
     database = urllib.parse.quote(table.database, safe="")
     table_name = urllib.parse.quote(table.table, safe="")
@@ -399,7 +411,7 @@ def discover_tablets(
     )
     request.add_unredirected_header("Authorization", f"Basic {authorization}")
     try:
-        with _open_query_plan(request, limits.connect_timeout_seconds) as response:
+        with _open_query_plan(request, planning_timeout_seconds) as response:
             if response.status != _HTTP_OK:
                 raise DiscoveryError(f"Doris query-plan endpoint returned HTTP {response.status}")
             body = response.read(_MAX_QUERY_PLAN_RESPONSE_BYTES + 1)
@@ -411,7 +423,13 @@ def discover_tablets(
         if exc.code == _HTTP_FORBIDDEN:
             raise DatabasePermissionError("Doris denied access to tablet planning") from None
         raise DiscoveryError(f"Doris query-plan endpoint returned HTTP {exc.code}") from None
-    except (OSError, TimeoutError):
+    except TimeoutError:
+        raise DiscoveryError("Doris query-plan request timed out") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise DiscoveryError("Doris query-plan request timed out") from None
+        raise DiscoveryError("Doris query-plan endpoint is unavailable") from None
+    except OSError:
         raise DiscoveryError("Doris query-plan endpoint is unavailable") from None
     try:
         payload = json.loads(body.decode("utf-8"))

@@ -32,6 +32,7 @@ from daft_olap._common.contracts import (
     SplitMode,
     freeze_query_parameters,
     group_adjacent_ids,
+    validate_timeout_seconds,
 )
 from daft_olap._common.errors import CompatibilityError, ConfigurationError, DiscoveryError
 from daft_olap._common.identifiers import QualifiedTable
@@ -54,7 +55,7 @@ from daft_olap.doris.schema import project_schema
 from daft_olap.doris.sql import build_select
 from daft_olap.doris.task import DorisTask, DorisTransport
 
-TabletDiscoverer = Callable[[str, tuple[Any, ...]], tuple[int, ...]]
+TabletDiscoverer = Callable[[str, tuple[Any, ...], float], tuple[int, ...]]
 DorisTaskFactory = Callable[
     [DorisConnection, QuerySpec, ResourceLimits, DorisTransport], DataSourceTask
 ]
@@ -93,6 +94,7 @@ class DorisDataSource(DataSource):
         max_tasks: int = 256,
         connect_timeout_seconds: float = 10.0,
         query_timeout_seconds: float = 300.0,
+        planning_timeout_seconds: float = 10.0,
         unsafe_where_sql: str | None = None,
         query_parameters: Mapping[str, Any] | None = None,
         mysql_options: Mapping[str, Any] | None = None,
@@ -116,6 +118,9 @@ class DorisDataSource(DataSource):
         self._transport = transport
         self._split = split
         self._discovery_policy = discovery_policy
+        self._planning_timeout_seconds = validate_timeout_seconds(
+            "planning_timeout_seconds", planning_timeout_seconds
+        )
         self._limits = ResourceLimits(
             batch_rows=batch_rows,
             batch_bytes=batch_bytes,
@@ -180,7 +185,10 @@ class DorisDataSource(DataSource):
         try:
             if self._tablet_discoverer is not None:
                 tablet_ids = await asyncio.to_thread(
-                    self._tablet_discoverer, planning_sql, planning_parameters
+                    self._tablet_discoverer,
+                    planning_sql,
+                    planning_parameters,
+                    self._planning_timeout_seconds,
                 )
             else:
                 tablet_ids = await asyncio.to_thread(
@@ -190,6 +198,7 @@ class DorisDataSource(DataSource):
                     planning_sql,
                     planning_parameters,
                     self._limits,
+                    planning_timeout_seconds=self._planning_timeout_seconds,
                 )
         except DiscoveryError as error:
             if self._discovery_policy == "error":

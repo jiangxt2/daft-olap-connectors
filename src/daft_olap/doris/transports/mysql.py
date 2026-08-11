@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import suppress
 from decimal import DecimalException
 from typing import Any
 
@@ -27,6 +26,7 @@ from daft_olap._common.errors import DaftOlapError, SchemaError, TransportError
 from daft_olap.doris.discovery import DorisConnection, mysql_driver
 from daft_olap.doris.errors import translate_doris_error
 from daft_olap.doris.schema import coerce_decimal
+from daft_olap.doris.transports._pymysql import SSCursorLifecycle
 from daft_olap.doris.transports._thread import TaskThread
 
 ConnectionFactory = Callable[..., Any]
@@ -97,6 +97,7 @@ class MySqlBatchReader:
         self._thread = TaskThread(name="daft-doris-mysql")
         self._connection: Any = None
         self._cursor: Any = None
+        self._cursor_lifecycle: SSCursorLifecycle | None = None
         self._column_names: tuple[str, ...] = ()
         self._fetch_rows = limits.batch_rows
 
@@ -107,8 +108,11 @@ class MySqlBatchReader:
         kwargs["cursorclass"] = driver.cursors.SSCursor
         self._connection = factory(**kwargs)
         self._cursor = self._connection.cursor()
+        self._cursor_lifecycle = SSCursorLifecycle(self._cursor, self._connection)
+        self._cursor_lifecycle.validate_cursor()
         parameters = self._query.positional_parameters or None
         self._cursor.execute(self._query.sql, parameters)
+        self._cursor_lifecycle.validate_result()
         if self._cursor.description is None:
             raise TransportError("Doris MySQL SELECT returned no column metadata")
         self._column_names = tuple(description[0] for description in self._cursor.description)
@@ -127,30 +131,15 @@ class MySqlBatchReader:
         return batch
 
     def _close(self) -> None:
-        failure: Exception | None = None
-        try:
-            if self._connection is not None:
-                self._connection.close()
-        except Exception as exc:
-            failure = exc
-        if self._cursor is not None:
-            # PyMySQL SSCursor.close() drains every unread row. This task owns the connection, so
-            # close the socket first and detach the cursor to make early stop an abort.
-            result = getattr(self._cursor, "_result", None)
-            if result is not None:
-                with suppress(AttributeError, TypeError):
-                    result.unbuffered_active = False
-                with suppress(AttributeError, TypeError):
-                    result.connection = None
-            with suppress(AttributeError, TypeError):
-                self._cursor.connection = None
-            try:
-                self._cursor.close()
-            except Exception:
-                if failure is None:
-                    raise
-        if failure is not None:
-            raise failure
+        lifecycle = self._cursor_lifecycle
+        connection = self._connection
+        self._cursor_lifecycle = None
+        self._cursor = None
+        self._connection = None
+        if lifecycle is not None:
+            lifecycle.close()
+        elif connection is not None:
+            connection.close()
 
     async def start(self) -> None:
         """Open and execute on the dedicated thread."""

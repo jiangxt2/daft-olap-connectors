@@ -584,6 +584,7 @@ def test_doris_connection_validation_options_secret_and_kwargs(
             )
     for flight_option in (
         "adbc.flight.sql.client_option.with_block",
+        "adbc.flight.sql.rpc.timeout_seconds.connect",
         "adbc.flight.sql.rpc.timeout_seconds.fetch",
         "adbc.flight.sql.rpc.timeout_seconds.query",
     ):
@@ -844,9 +845,16 @@ def test_doris_query_plan_response_rejects_every_malformed_envelope(
 
 
 class FakeHttpResponse:
-    def __init__(self, *, status: int = 200, body: bytes = b"") -> None:
+    def __init__(
+        self,
+        *,
+        status: int = 200,
+        body: bytes = b"",
+        read_error: BaseException | None = None,
+    ) -> None:
         self.status = status
         self._body = body
+        self._read_error = read_error
         self.read_sizes: list[int] = []
 
     def __enter__(self) -> FakeHttpResponse:
@@ -857,6 +865,8 @@ class FakeHttpResponse:
 
     def read(self, size: int = -1) -> bytes:
         self.read_sizes.append(size)
+        if self._read_error is not None:
+            raise self._read_error
         return self._body if size < 0 else self._body[:size]
 
 
@@ -896,6 +906,7 @@ def test_doris_tablet_discovery_builds_authenticated_encoded_request(
         "SELECT 1",
         (),
         ResourceLimits(connect_timeout_seconds=4),
+        planning_timeout_seconds=6.5,
     )
     assert result == (2, 4)
     request = cast(urllib.request.Request, captured["request"])
@@ -903,7 +914,31 @@ def test_doris_tablet_discovery_builds_authenticated_encoded_request(
     authorization = request.get_header("Authorization")
     assert authorization is not None
     assert authorization.startswith("Basic ")
-    assert captured["timeout"] == 4
+    assert captured["timeout"] == 6.5
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, 0, -1, float("nan"), float("inf"), 86_401, "10"],
+)
+def test_doris_tablet_discovery_rejects_invalid_planning_timeout_before_sql_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    monkeypatch.setattr(
+        doris,
+        "_materialize_plan_sql",
+        lambda *args: pytest.fail("SQL binding must not run"),
+    )
+    with pytest.raises(ConfigurationError, match="planning_timeout_seconds"):
+        doris.discover_tablets(
+            doris.DorisConnection(host="host", database="db"),
+            QualifiedTable("db", "events"),
+            "SELECT 1",
+            (),
+            ResourceLimits(),
+            planning_timeout_seconds=cast(Any, value),
+        )
 
 
 def test_doris_tablet_discovery_supports_https_and_ipv6(
@@ -965,7 +1000,23 @@ def test_doris_tablet_discovery_bounds_query_plan_response(
             DiscoveryError,
             "HTTP 500",
         ),
+        (TimeoutError("private timeout detail"), DiscoveryError, "timed out"),
+        (
+            urllib.error.URLError(TimeoutError("private wrapped timeout detail")),
+            DiscoveryError,
+            "timed out",
+        ),
+        (
+            urllib.error.URLError("private unavailable detail"),
+            DiscoveryError,
+            "unavailable",
+        ),
         (OSError("offline"), DiscoveryError, "unavailable"),
+        (
+            FakeHttpResponse(read_error=TimeoutError("private body timeout detail")),
+            DiscoveryError,
+            "timed out",
+        ),
         (FakeHttpResponse(body=b"not-json"), DiscoveryError, "invalid JSON"),
     ],
 )
@@ -983,7 +1034,7 @@ def test_doris_tablet_discovery_classifies_http_and_payload_failures(
         return effect
 
     monkeypatch.setattr(doris, "_open_query_plan", open_request)
-    with pytest.raises(error_type, match=message):
+    with pytest.raises(error_type, match=message) as captured:
         doris.discover_tablets(
             doris.DorisConnection(host="host", database="db"),
             QualifiedTable("db", "events"),
@@ -991,6 +1042,9 @@ def test_doris_tablet_discovery_classifies_http_and_payload_failures(
             (),
             ResourceLimits(),
         )
+    assert "private" not in str(captured.value)
+    assert "http://host" not in str(captured.value)
+    assert "SELECT 1" not in str(captured.value)
 
 
 def test_optional_driver_imports_have_actionable_errors(monkeypatch: pytest.MonkeyPatch) -> None:

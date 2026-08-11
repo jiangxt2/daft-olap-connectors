@@ -14,13 +14,16 @@ ranges are widened.
 | PyArrow | `>=16,<25` | 16.1.0, 19.0.1, and 24.0.0 |
 | Ray through `daft[ray]` | `>=2.11,<2.56` | 2.55.1 |
 | clickhouse-connect | `>=1.0.1,<1.6` | 1.5.0 |
-| PyMySQL | `>=1.1,<3` | 1.2.0 |
+| PyMySQL | `>=1.2,<1.3` | 1.2.0 |
 | ADBC Flight SQL | `>=1.6,<2` | 1.12.0 |
 | ClickHouse server | fixed IT image | 25.3.2.39 |
 | Apache Doris | fixed IT images | 4.0.6 |
 
 The exact lock and fixed integration image tags are the development evidence. Published compatibility
 claims must be narrowed to combinations that have passed unit, native, Ray, and real database tests.
+For PyMySQL, 1.2.0 is the actually validated release. The allowed `>=1.2,<1.3` resolver range does
+not certify an untested future 1.2 patch; expanding to another minor line requires its own
+capability contract and real Doris lifecycle test.
 
 The public `DataSource.supports_count_pushdown()` capability is present from Daft 0.7.22. This
 project keeps 0.7.23 as its minimum because that is the fully validated connector and Tributo
@@ -67,6 +70,12 @@ Doris 4.0.6 accepts complete Flight SQL statements but its
 `acceptPutPreparedStatementQuery` implementation is explicitly unimplemented. Flight filters
 therefore use the connector's strict typed literal renderer instead of ADBC parameter binding.
 This behavior is covered by injection-payload unit tests and real MySQL/Flight result comparisons.
+
+ADBC Flight SQL 1.12.0 documents a 20-second default for the database-level connect RPC timeout but
+does not expose that option through its Python `DatabaseOptions` enum. The connector passes the
+official raw `adbc.flight.sql.rpc.timeout_seconds.connect` key from `connect_timeout_seconds`.
+Against the fixed local Doris 4.0.6 endpoint, integration tests use an explicit one-second budget;
+the public default remains 10 seconds for non-local deployments.
 
 ## Serializable configuration values
 

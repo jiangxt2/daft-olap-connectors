@@ -277,22 +277,36 @@ class ReaderCursor:
         self.rows = rows
         self.executed_parameters: object = object()
         self.close_calls = 0
+        self.connection: ReaderConnection | None = None
+        self._result: Any = None
 
     def execute(self, sql: str, parameters: object) -> None:
         self.executed_parameters = parameters
+        result = SimpleNamespace(unbuffered_active=True, connection=self.connection)
+        self._result = result
+        assert self.connection is not None
+        self.connection._result = result
 
     def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
         batch, self.rows = self.rows[:size], self.rows[size:]
+        if len(batch) < size:
+            self._result.unbuffered_active = False
+            self._result.connection = None
         return batch
 
     def close(self) -> None:
         self.close_calls += 1
+        if self.connection is not None and self._result.unbuffered_active:
+            raise AssertionError("unbuffered drain must not run")
+        self.connection = None
 
 
 class ReaderConnection:
     def __init__(self, cursor: ReaderCursor) -> None:
         self._cursor = cursor
+        self._result: Any = None
         self.close_calls = 0
+        cursor.connection = self
 
     def cursor(self) -> ReaderCursor:
         return self._cursor

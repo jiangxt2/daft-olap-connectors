@@ -32,6 +32,17 @@ _MAX_TASKS = 1_024
 _MAX_TIMEOUT_SECONDS = 86_400
 
 
+def validate_timeout_seconds(name: str, value: object) -> float:
+    """Return a validated timeout without exposing caller values in errors."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 < value <= _MAX_TIMEOUT_SECONDS
+    ):
+        raise ConfigurationError(f"{name} must be between 0 and 86,400 seconds")
+    return float(value)
+
+
 def _snapshot_error(value: Any, *, value_path: str) -> ConfigurationError:
     return ConfigurationError(
         f"{value_path} value of type {type(value).__name__} must be safely serializable"
@@ -229,12 +240,7 @@ class ResourceLimits:
             ("connect_timeout_seconds", self.connect_timeout_seconds),
             ("query_timeout_seconds", self.query_timeout_seconds),
         ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not 0 < value <= _MAX_TIMEOUT_SECONDS
-            ):
-                raise ConfigurationError(f"{name} must be between 0 and 86,400 seconds")
+            validate_timeout_seconds(name, value)
 
 
 def iter_batch_slices(
