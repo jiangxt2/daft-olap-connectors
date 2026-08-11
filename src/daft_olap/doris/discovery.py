@@ -20,12 +20,13 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
 
-from daft_olap._common.contracts import ResourceLimits, freeze_options
+from daft_olap._common.contracts import ResourceLimits, freeze_options, thaw_options
 from daft_olap._common.errors import (
     AuthenticationError,
     CompatibilityError,
@@ -161,8 +162,8 @@ class DorisConnection:
         mysql_port: int,
         http_port: int,
         flight_port: int,
-        mysql_options: dict[str, Any] | None,
-        flight_options: dict[str, str] | None,
+        mysql_options: Mapping[str, Any] | None,
+        flight_options: Mapping[str, str] | None,
         http_secure: bool = False,
         flight_secure: bool = False,
     ) -> DorisConnection:
@@ -206,7 +207,7 @@ class DorisConnection:
             "read_timeout": limits.query_timeout_seconds,
             "write_timeout": limits.query_timeout_seconds,
         }
-        kwargs.update(dict(self.mysql_options))
+        kwargs.update(thaw_options(self.mysql_options, option_name="mysql_options"))
         return kwargs
 
     def _authority(self, port: int) -> str:

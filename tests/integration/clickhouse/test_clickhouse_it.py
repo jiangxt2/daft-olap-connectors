@@ -107,7 +107,7 @@ def _password() -> str:
 
 
 def _source(
-    *, split: str = "auto", table: str = "events", **options: object
+    *, split: str = "single", table: str = "events", **options: object
 ) -> ClickHouseDataSource:
     return ClickHouseDataSource(
         host="127.0.0.1",
@@ -144,7 +144,6 @@ def test_projection_filter_limit_count_nulls_and_repeat_collect() -> None:
         table="events",
         columns=("id", "kind"),
         filter=daft.col("score") >= 25,
-        split="auto",
         batch_rows=2,
         target_tasks=3,
     ).sort("id")

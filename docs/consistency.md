@@ -2,7 +2,8 @@
 
 ## Parallel reads
 
-A parallel connector scan is a set of independent SQL queries. It is not a distributed transaction
+The default `split="single"` scan is one task and one database query. A parallel scan requires an
+explicit `split="auto"` and is a set of independent SQL queries. It is not a distributed transaction
 and does not create a shared snapshot. Inserts, deletes, ClickHouse mutations and part merges, or
 Doris compaction and tablet changes during a scan can change what different tasks observe.
 
@@ -15,8 +16,9 @@ Split metadata uses logical `partition_id`, not individual part names. A part me
 logical partition therefore does not invalidate the task predicate. The set of partition IDs is a
 planning-time snapshot: writes to an already discovered partition follow each query's visibility,
 but a partition first created after discovery is absent from every planned task and is not
-guaranteed to appear. Stable-table equivalence tests do not claim to cover concurrent writes. Use
-`split="single"`, immutable partitions, or a database-side snapshot strategy for a stricter boundary.
+guaranteed to appear. Stable-table equivalence tests do not claim to cover concurrent writes. Keep
+the default `split="single"`, use immutable partitions, or use a database-side snapshot strategy
+for a stricter boundary.
 
 Automatic splitting also requires the configured endpoint to keep discovery and all physical-table
 queries on the same ClickHouse server. A load balancer that can route tasks to different replicas or

@@ -41,7 +41,6 @@ def clickhouse_source() -> ClickHouseDataSource:
         host="fake-clickhouse",
         database="analytics",
         table="events",
-        split="single",
         _arrow_schema=ARROW_SCHEMA,
         _task_factory=clickhouse_task_factory,
     )
@@ -54,7 +53,6 @@ def doris_source() -> DorisDataSource:
         database="analytics",
         table="events",
         transport="mysql",
-        split="single",
         _arrow_schema=ARROW_SCHEMA,
         _task_factory=doris_task_factory,
     )

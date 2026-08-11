@@ -588,7 +588,7 @@ def test_public_read_apis_construct_lazy_sources_then_apply_filter_and_projectio
     )
     assert cast(Any, clickhouse_frame).columns == ("id",)
     assert cast(Any, clickhouse_frame).filter_value is expression
-    assert FakeSource.last_options["split"] == "auto"
+    assert FakeSource.last_options["split"] == "single"
     assert FakeSource.last_options["batch_bytes"] == 64 * 1024 * 1024
 
     monkeypatch.setattr(doris_api, "DorisDataSource", FakeSource)
@@ -607,6 +607,7 @@ def test_public_read_apis_construct_lazy_sources_then_apply_filter_and_projectio
     assert FakeSource.last_options["transport"] == "flight"
     assert FakeSource.last_options["http_secure"] is True
     assert FakeSource.last_options["flight_secure"] is True
+    assert FakeSource.last_options["split"] == "single"
     assert FakeSource.last_options["batch_bytes"] == 64 * 1024 * 1024
 
 

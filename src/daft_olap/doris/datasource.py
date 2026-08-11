@@ -30,8 +30,8 @@ from daft_olap._common.contracts import (
     QuerySpec,
     ResourceLimits,
     SplitMode,
+    freeze_query_parameters,
     group_adjacent_ids,
-    validate_query_parameter_values,
 )
 from daft_olap._common.errors import CompatibilityError, ConfigurationError, DiscoveryError
 from daft_olap._common.identifiers import QualifiedTable
@@ -85,7 +85,7 @@ class DorisDataSource(DataSource):
         flight_secure: bool = False,
         username: str = "root",
         password: Secret = "",
-        split: SplitMode = "auto",
+        split: SplitMode = "single",
         discovery_policy: DiscoveryPolicy = "single",
         batch_rows: int = 65_536,
         batch_bytes: int = 64 * 1024 * 1024,
@@ -111,10 +111,7 @@ class DorisDataSource(DataSource):
             not isinstance(unsafe_where_sql, str) or not unsafe_where_sql.strip()
         ):
             raise ConfigurationError("unsafe_where_sql must be None or a non-empty SQL fragment")
-        parameters = tuple((query_parameters or {}).items())
-        if any(not isinstance(key, str) or not key for key, _ in parameters):
-            raise ConfigurationError("query parameter names must be non-empty strings")
-        validate_query_parameter_values(value for _, value in parameters)
+        parameters = freeze_query_parameters(query_parameters)
         self._table = QualifiedTable(database, table)
         self._transport = transport
         self._split = split
@@ -137,8 +134,8 @@ class DorisDataSource(DataSource):
             flight_port=flight_port,
             http_secure=http_secure,
             flight_secure=flight_secure,
-            mysql_options=dict(mysql_options) if mysql_options is not None else None,
-            flight_options=dict(flight_options) if flight_options is not None else None,
+            mysql_options=mysql_options,
+            flight_options=flight_options,
         )
         self._unsafe_where_sql = unsafe_where_sql.strip() if unsafe_where_sql is not None else None
         self._query_parameters = parameters

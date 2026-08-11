@@ -68,6 +68,19 @@ Doris 4.0.6 accepts complete Flight SQL statements but its
 therefore use the connector's strict typed literal renderer instead of ADBC parameter binding.
 This behavior is covered by injection-payload unit tests and real MySQL/Flight result comparisons.
 
+## Serializable configuration values
+
+Public query-parameter and driver-option values must support a standard-library pickle round trip.
+This is intentionally stricter than accepting values that work only because Ray installs
+`cloudpickle`: the base connector does not depend on Ray. Nested dict, list, tuple, set, frozenset,
+database scalar, and serializable custom values retain their types and are isolated from later
+caller mutation. Driver-specific validity is still enforced by the selected database driver.
+
+Callables, cyclic containers, open files or sockets, live clients/cursors/readers, `SSLContext`, and
+other runtime objects that cannot be safely reconstructed are unsupported. They fail on the driver
+before schema discovery or worker startup, and the error exposes only a safe option path and type,
+never the value or the underlying pickle exception text.
+
 ## Type policy
 
 Schema mapping is fail closed. A type is supported only after its declaration, driver value, Arrow

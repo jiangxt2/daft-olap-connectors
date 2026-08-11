@@ -37,7 +37,7 @@ def read_clickhouse(
     secure: bool = False,
     columns: Iterable[str] | None = None,
     filter: Expression | None = None,
-    split: SplitMode = "auto",
+    split: SplitMode = "single",
     discovery_policy: DiscoveryPolicy = "single",
     batch_rows: int = 65_536,
     batch_bytes: int = 64 * 1024 * 1024,
