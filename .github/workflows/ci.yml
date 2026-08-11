@@ -16,12 +16,19 @@ on:
   pull_request:
   push:
     branches: [master]
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Immutable release candidate commit to test
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.candidate_sha || 'direct' }}
   cancel-in-progress: true
 
 jobs:
@@ -30,8 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
@@ -40,23 +49,16 @@ jobs:
       - run: uv run ruff format --check src tests scripts benchmarks
       - run: uv run mypy src tests/unit tests/contract
       - run: uv run python scripts/check_license_headers.py
+      - run: >-
+          uv run python scripts/check_workflow_pins.py
+          .github/workflows/ci.yml .github/workflows/release.yml
+      - run: >-
+          uv run python scripts/check_release_workflow.py
+          .github/workflows/ci.yml .github/workflows/release.yml
       - run: uv run codespell
       - run: uv run mkdocs build --strict
-      - run: uv run python -m build
-
-  dco:
-    name: DCO trailers
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-      - run: uv run --no-project python scripts/check_dco.py "origin/${{ github.base_ref }}" HEAD
+      - if: inputs.candidate_sha == ''
+        run: uv run python -m build
 
   contract:
     name: ${{ matrix.profile }} / Python ${{ matrix.python }} / Daft ${{ matrix.daft }} / Ray ${{ matrix.ray }} / PyArrow ${{ matrix.pyarrow }}
@@ -91,8 +93,10 @@ jobs:
             ray: "2.55.1"
             ray_requirement: "ray==2.55.1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
@@ -113,15 +117,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --locked --all-extras --group dev
       - run: ./scripts/run_clickhouse_it.sh
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: clickhouse-it-logs
           path: .artifacts/it
@@ -133,15 +139,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --locked --all-extras --group dev
       - run: ./scripts/run_doris_it.sh
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: doris-it-logs
           path: .artifacts/it

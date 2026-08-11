@@ -15,113 +15,302 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Full master-reachable commit SHA to validate without publishing
+        required: true
+        type: string
+      expected_version:
+        description: Exact package version expected at candidate_sha
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref || inputs.candidate_sha }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  candidate:
+    name: Validate release candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.candidate.outputs.mode }}
+      sha: ${{ steps.candidate.outputs.sha }}
+      version: ${{ steps.candidate.outputs.version }}
+      tag: ${{ steps.candidate.outputs.tag }}
+      master_sha: ${{ steps.candidate.outputs.master_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v6
+          persist-credentials: false
+          ref: master
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+      - name: Fetch protected master identity
+        run: >-
+          git fetch --force origin
+          +refs/heads/master:refs/remotes/origin/master
+          +refs/tags/*:refs/tags/*
+      - name: Resolve immutable candidate
+        id: candidate
+        env:
+          CANDIDATE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.ref }}
+          EXPECTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_version || '' }}
+          MODE: ${{ github.event_name == 'workflow_dispatch' && 'dry-run' || 'tag' }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          EVENT_SHA: ${{ github.event_name == 'push' && github.event.after || '' }}
+          EVENT_CREATED: ${{ github.event_name == 'push' && github.event.created || false }}
+          EVENT_DELETED: ${{ github.event_name == 'push' && github.event.deleted || false }}
+          EVENT_FORCED: ${{ github.event_name == 'push' && github.event.forced || false }}
+        run: >-
+          python scripts/validate_release_candidate.py
+          --mode "${MODE}"
+          --candidate-ref "${CANDIDATE_REF}"
+          --expected-version "${EXPECTED_VERSION}"
+          --tag "${RELEASE_TAG}"
+          --master-ref origin/master
+          --event-sha "${EVENT_SHA}"
+          --event-created "${EVENT_CREATED}"
+          --event-deleted "${EVENT_DELETED}"
+          --event-forced "${EVENT_FORCED}"
+          --github-output "${GITHUB_OUTPUT}"
+
+  gates:
+    name: Candidate CI gates
+    needs: candidate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      candidate_sha: ${{ needs.candidate.outputs.sha }}
+
+  build:
+    name: Build and scan distributions
+    needs: [candidate, gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      distributions_artifact_id: ${{ steps.upload-distributions.outputs.artifact-id }}
+      distributions_artifact_digest: ${{ steps.upload-distributions.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
       - run: uv sync --locked --all-extras --group dev
-      - name: Validate tag matches package version
-        run: |
-          package_version="$(uv run python -c 'from importlib.metadata import version; print(version("daft-olap-connectors"))')"
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
-      - name: Scan repository for credentials
-        uses: trufflesecurity/trufflehog@v3.95.2
+      - name: Scan candidate for credentials
+        uses: trufflesecurity/trufflehog@17456f8c7d042d8c82c9a8ca9e937231f9f42e26 # v3.95.2
         with:
           path: ./
           base: ""
-          head: ${{ github.ref_name }}
+          head: ${{ needs.candidate.outputs.sha }}
           extra_args: --results=verified,unknown
-      - run: uv run python -m build
-      - run: uvx twine check dist/*
+      - name: Build distributions once
+        run: uv run python -m build --outdir release-artifacts/packages
+      - name: Validate distribution metadata
+        run: uvx twine check release-artifacts/packages/*
+      - name: Create and verify distribution manifest
+        run: >-
+          uv run python scripts/verify_release_artifacts.py release-artifacts/packages
+          --name daft-olap-connectors
+          --version "${{ needs.candidate.outputs.version }}"
+          --manifest release-artifacts/SHA256SUMS
+          --prepare
       - name: Generate distribution SBOM
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          path: dist/
+          path: release-artifacts/packages/
           format: spdx-json
           output-file: daft-olap-connectors-sbom.spdx.json
           artifact-name: sbom
           upload-artifact: false
           upload-release-assets: false
-      - uses: actions/upload-artifact@v4
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom
           path: daft-olap-connectors-sbom.spdx.json
-      - uses: actions/upload-artifact@v4
+          if-no-files-found: error
+      - name: Upload distributions
+        id: upload-distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: distributions
-          path: dist/
+          path: release-artifacts/
+          if-no-files-found: error
+      - name: Record distribution artifact identity
+        env:
+          ARTIFACT_ID: ${{ steps.upload-distributions.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-distributions.outputs.artifact-digest }}
+        run: |
+          test -n "${ARTIFACT_ID}"
+          [[ "${ARTIFACT_DIGEST}" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "### Distribution artifact"
+            echo
+            echo "- ID: \`${ARTIFACT_ID}\`"
+            echo "- SHA-256: \`${ARTIFACT_DIGEST}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   install-smoke:
-    needs: build
+    name: Install ${{ matrix.profile }}
+    needs: [candidate, gates, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        install:
-          - daft-olap-connectors
-          - daft-olap-connectors[clickhouse]
-          - daft-olap-connectors[doris]
-          - daft-olap-connectors[doris-flight]
-          - daft-olap-connectors[ray]
+        include:
+          - profile: base
+            extra: ""
+          - profile: clickhouse
+            extra: "[clickhouse]"
+          - profile: doris
+            extra: "[doris]"
+          - profile: doris-flight
+            extra: "[doris-flight]"
+          - profile: ray
+            extra: "[ray]"
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: distributions
-          path: dist/
-      - name: Install built distribution
-        run: python -m pip install --find-links dist/ "${{ matrix.install }}==${GITHUB_REF_NAME#v}"
-      - name: Import public package
+          artifact-ids: ${{ needs.build.outputs.distributions_artifact_id }}
+          path: release/
+          merge-multiple: true
+      - name: Verify downloaded distributions
         run: >-
-          python -c 'from importlib.metadata import version; import daft_olap;
-          assert daft_olap.__version__ == version("daft-olap-connectors")'
+          python scripts/verify_release_artifacts.py release/packages
+          --name daft-olap-connectors
+          --version "${{ needs.candidate.outputs.version }}"
+          --manifest release/SHA256SUMS
+      - name: Install built distribution
+        env:
+          EXTRA: ${{ matrix.extra }}
+        run: |
+          wheel="$(find release/packages -maxdepth 1 -type f -name '*.whl')"
+          test -n "${wheel}"
+          python -m pip install "daft-olap-connectors${EXTRA} @ file://${GITHUB_WORKSPACE}/${wheel}"
+      - name: Import installation profile
+        run: >-
+          python scripts/check_install_profile.py "${{ matrix.profile }}"
+          --version "${{ needs.candidate.outputs.version }}"
 
   publish:
-    needs: [build, install-smoke]
+    name: Publish to PyPI
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.candidate.result == 'success' &&
+      needs.gates.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.install-smoke.result == 'success' &&
+      needs.candidate.outputs.mode == 'tag'
+    needs: [candidate, gates, build, install-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          name: distributions
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.distributions_artifact_id }}
+          path: release/
+          merge-multiple: true
+      - name: Revalidate live release tag
+        run: >-
+          python scripts/verify_release_tag.py
+          --tag "${{ needs.candidate.outputs.tag }}"
+          --expected-sha "${{ needs.candidate.outputs.sha }}"
+      - name: Revalidate distribution identity and manifest
+        run: >-
+          python scripts/verify_release_artifacts.py release/packages
+          --name daft-olap-connectors
+          --version "${{ needs.candidate.outputs.version }}"
+          --manifest release/SHA256SUMS
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          attestations: false
+          packages-dir: release/packages/
 
   github-release:
-    needs: [build, publish]
+    name: Create GitHub Release
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.candidate.result == 'success' &&
+      needs.gates.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.install-smoke.result == 'success' &&
+      needs.publish.result == 'success' &&
+      needs.candidate.outputs.mode == 'tag'
+    needs: [candidate, gates, build, install-smoke, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          name: distributions
-          path: dist/
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+          ref: ${{ needs.candidate.outputs.sha }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.distributions_artifact_id }}
+          path: release/
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: sbom
           path: sbom/
+      - name: Revalidate live release tag
+        run: >-
+          python scripts/verify_release_tag.py
+          --tag "${{ needs.candidate.outputs.tag }}"
+          --expected-sha "${{ needs.candidate.outputs.sha }}"
+      - name: Revalidate distribution identity and manifest
+        run: >-
+          python scripts/verify_release_artifacts.py release/packages
+          --name daft-olap-connectors
+          --version "${{ needs.candidate.outputs.version }}"
+          --manifest release/SHA256SUMS
       - name: Publish immutable release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          gh release create "${GITHUB_REF_NAME}" dist/* sbom/*
-          --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+          gh release create "${{ needs.candidate.outputs.tag }}"
+          release/packages/* release/SHA256SUMS sbom/*
+          --verify-tag --generate-notes --title "${{ needs.candidate.outputs.tag }}"
