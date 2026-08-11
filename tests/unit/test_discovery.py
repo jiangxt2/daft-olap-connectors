@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import sys
 import urllib.error
 from collections.abc import Callable, Sequence
@@ -222,6 +223,36 @@ def test_clickhouse_connection_validation_freezing_secret_and_kwargs(
                 settings={managed_setting: 1},
                 client_options=None,
             )
+
+
+def test_clickhouse_connection_snapshots_nested_options_and_returns_fresh_kwargs() -> None:
+    setting_value = {"labels": ["before"]}
+    client_value = {"headers": ["before"]}
+    settings = {"custom_setting": setting_value}
+    client_options = {"custom_client": client_value}
+    connection = clickhouse.ClickHouseConnection.from_options(
+        host="localhost",
+        database="analytics",
+        username="reader",
+        password="",
+        port=8123,
+        secure=False,
+        settings=settings,
+        client_options=client_options,
+    )
+
+    setting_value["labels"].append("after")
+    client_value["headers"].append("after")
+
+    settings = connection.settings_kwargs()
+    assert settings == {"custom_setting": {"labels": ["before"]}}
+    settings["custom_setting"]["labels"].append("mutated")
+    assert connection.settings_kwargs() == {"custom_setting": {"labels": ["before"]}}
+    first = connection.client_kwargs(ResourceLimits())
+    assert first["custom_client"] == {"headers": ["before"]}
+    cast(list[str], first["custom_client"]["headers"]).append("mutated")
+    assert connection.client_kwargs(ResourceLimits())["custom_client"] == {"headers": ["before"]}
+    assert pickle.loads(pickle.dumps(connection)) == connection
 
 
 @pytest.mark.parametrize(
@@ -568,6 +599,33 @@ def test_doris_connection_validation_options_secret_and_kwargs(
                 mysql_options=None,
                 flight_options={flight_option: "0"},
             )
+
+
+def test_doris_connection_snapshots_nested_options_and_returns_fresh_kwargs() -> None:
+    ssl_value = {"ca": ["before"]}
+    mysql_options = {"ssl": ssl_value}
+    flight_options = {"adbc.option": "before"}
+    connection = doris.DorisConnection.from_options(
+        host="host",
+        database="db",
+        username="reader",
+        password="",
+        mysql_port=9030,
+        http_port=8030,
+        flight_port=8070,
+        mysql_options=mysql_options,
+        flight_options=flight_options,
+    )
+
+    ssl_value["ca"].append("after")
+    flight_options["adbc.option"] = "after"
+
+    first = connection.mysql_kwargs(ResourceLimits())
+    assert first["ssl"] == {"ca": ["before"]}
+    cast(list[str], first["ssl"]["ca"]).append("mutated")
+    assert connection.mysql_kwargs(ResourceLimits())["ssl"] == {"ca": ["before"]}
+    assert dict(connection.flight_options) == {"adbc.option": "before"}
+    assert pickle.loads(pickle.dumps(connection)) == connection
 
 
 @pytest.mark.parametrize(

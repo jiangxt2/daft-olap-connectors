@@ -13,9 +13,12 @@
 from __future__ import annotations
 
 import pickle
+import socket
+import ssl
 from datetime import UTC, datetime, time
 from importlib.metadata import version
-from typing import Any, cast
+from pathlib import Path
+from typing import Any, Never, cast
 
 import pyarrow as pa
 import pytest
@@ -38,6 +41,26 @@ from daft_olap._common.identifiers import (
     validate_identifier,
 )
 from daft_olap._common.redaction import SecretRef, resolve_secret, validate_secret
+
+
+class _UnpickleableCanary:
+    def __reduce__(self) -> Never:
+        raise TypeError("sensitive-object-value")
+
+    def __repr__(self) -> str:
+        return "sensitive-object-value"
+
+
+class _LiveClient(_UnpickleableCanary):
+    pass
+
+
+class _LiveCursor(_UnpickleableCanary):
+    pass
+
+
+class _LiveReader(_UnpickleableCanary):
+    pass
 
 
 def test_runtime_version_matches_installed_distribution_metadata() -> None:
@@ -115,6 +138,46 @@ def test_freeze_options_copies_and_rejects_reserved_keys() -> None:
         freeze_options({"password": "x"}, reserved={"password"}, option_name="options")
 
 
+def test_freeze_options_snapshots_nested_caller_owned_values() -> None:
+    nested = {"items": [1, {"labels": {"before"}}]}
+    values = {"z": 1, "nested": nested}
+    frozen = freeze_options(values, reserved=set(), option_name="options")
+
+    cast(list[Any], nested["items"]).append(2)
+    cast(set[str], cast(list[Any], nested["items"])[1]["labels"]).add("after")
+
+    frozen_nested = cast(dict[str, Any], dict(frozen)["nested"])
+    assert frozen_nested == {"items": [1, {"labels": {"before"}}]}
+    assert pickle.loads(pickle.dumps(frozen)) == frozen
+
+
+def test_freeze_options_rejects_runtime_objects_cycles_and_sensitive_error_text(
+    tmp_path: Path,
+) -> None:
+    def assert_rejected(value: object, expected: str) -> None:
+        with pytest.raises(ConfigurationError) as captured:
+            freeze_options({"safe_name": value}, reserved=set(), option_name="options")
+        message = str(captured.value)
+        assert expected in message
+        assert "sensitive-object-value" not in message
+
+    assert_rejected(lambda: None, "function")
+    assert_rejected(ssl.create_default_context(), "SSLContext")
+    assert_rejected(_UnpickleableCanary(), "_UnpickleableCanary")
+    assert_rejected(_LiveClient(), "_LiveClient")
+    assert_rejected(_LiveCursor(), "_LiveCursor")
+    assert_rejected(_LiveReader(), "_LiveReader")
+    with socket.socket() as connection:
+        assert_rejected(connection, "socket")
+    with (tmp_path / "sensitive-object-value").open("w", encoding="utf-8") as stream:
+        assert_rejected(stream, "TextIOWrapper")
+
+    cyclic: list[Any] = []
+    cyclic.append(cyclic)
+    with pytest.raises(ConfigurationError, match="cycle"):
+        freeze_options({"safe_name": cyclic}, reserved=set(), option_name="options")
+
+
 def test_query_spec_rejects_mixed_parameter_styles() -> None:
     with pytest.raises(ConfigurationError, match="mix"):
         QuerySpec(sql="SELECT 1", positional_parameters=(1,), named_parameters=(("x", 1),))
@@ -142,6 +205,24 @@ def test_query_spec_repr_and_temporal_validation_are_credential_safe() -> None:
     for value in aware_values:
         with pytest.raises(ConfigurationError, match="timezone-aware"):
             QuerySpec(sql="SELECT 1", positional_parameters=(value,))
+
+
+def test_query_spec_snapshots_nested_parameter_values() -> None:
+    positional = {"items": [1]}
+    named = {"labels": ["before"]}
+    query = QuerySpec(
+        sql="SELECT 1",
+        positional_parameters=(positional,),
+    )
+    named_query = QuerySpec(sql="SELECT 1", named_parameters=(("value", named),))
+
+    positional["items"].append(2)
+    named["labels"].append("after")
+
+    assert query.positional_parameters == ({"items": [1]},)
+    assert named_query.named_parameter_dict() == {"value": {"labels": ["before"]}}
+    assert pickle.loads(pickle.dumps(query)) == query
+    assert pickle.loads(pickle.dumps(named_query)) == named_query
 
 
 def test_grouping_algorithms_are_deterministic_and_bounded() -> None:

@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import pyarrow as pa
 
-from daft_olap._common.contracts import ResourceLimits, freeze_options
+from daft_olap._common.contracts import ResourceLimits, freeze_options, thaw_options
 from daft_olap._common.errors import (
     CompatibilityError,
     ConfigurationError,
@@ -118,8 +119,8 @@ class ClickHouseConnection:
         password: Secret,
         port: int,
         secure: bool,
-        settings: dict[str, Any] | None,
-        client_options: dict[str, Any] | None,
+        settings: Mapping[str, Any] | None,
+        client_options: Mapping[str, Any] | None,
     ) -> ClickHouseConnection:
         """Freeze caller-owned settings and protect connector-managed options."""
         return cls(
@@ -153,8 +154,12 @@ class ClickHouseConnection:
             "connect_timeout": limits.connect_timeout_seconds,
             "send_receive_timeout": limits.query_timeout_seconds,
         }
-        kwargs.update(dict(self.client_options))
+        kwargs.update(thaw_options(self.client_options, option_name="client_options"))
         return kwargs
+
+    def settings_kwargs(self) -> dict[str, Any]:
+        """Build fresh clickhouse-connect settings for one driver invocation."""
+        return thaw_options(self.settings, option_name="settings")
 
     def __repr__(self) -> str:
         return (
@@ -241,7 +246,7 @@ def discover_schema(
         projection = render_schema_projection(columns)
         arrow_table = client.query_arrow(
             f"SELECT {projection} FROM {table.sql()} LIMIT 0",
-            settings=dict(connection.settings),
+            settings=connection.settings_kwargs(),
             use_strings=True,
         )
         if not isinstance(arrow_table, pa.Table):

@@ -149,6 +149,24 @@ def test_doris_unsafe_parameters_must_be_exactly_consumed() -> None:
         )
 
 
+def test_doris_rejects_unserializable_options_before_schema_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "daft_olap.doris.datasource.discover_schema",
+        lambda *args, **kwargs: pytest.fail("schema discovery must not run"),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"mysql_options\['ssl'\].*function"):
+        DorisDataSource(
+            host="localhost",
+            database="analytics",
+            table="events",
+            transport="mysql",
+            mysql_options={"ssl": lambda: None},
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["mysql", "flight"])
 async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
@@ -170,6 +188,7 @@ async def test_doris_datasource_plans_tablet_tasks_without_transport_fallback(
         table="events",
         transport=transport,
         password="secret-value",
+        split="auto",
         target_tasks=2,
         max_tasks=2,
         _arrow_schema=SCHEMA,
@@ -208,6 +227,7 @@ async def test_doris_discovery_policy_warns_only_for_single_task_fallback(
         table="events",
         transport="mysql",
         password=secret,
+        split="auto",
         _arrow_schema=SCHEMA,
         _tablet_discoverer=fail_discovery,
     )
@@ -229,6 +249,7 @@ async def test_doris_discovery_policy_warns_only_for_single_task_fallback(
         table="events",
         transport="mysql",
         password=secret,
+        split="auto",
         discovery_policy="error",
         _arrow_schema=SCHEMA,
         _tablet_discoverer=fail_discovery,
@@ -248,6 +269,7 @@ async def test_doris_empty_tablet_pruning_emits_one_limit_zero_task() -> None:
         database="analytics",
         table="events",
         transport="mysql",
+        split="auto",
         _arrow_schema=SCHEMA,
         _tablet_discoverer=lambda sql, parameters: (),
     )
@@ -277,6 +299,7 @@ async def test_doris_nonrecoverable_discovery_errors_never_fall_back(
         database="analytics",
         table="events",
         transport="mysql",
+        split="auto",
         _arrow_schema=SCHEMA,
         _tablet_discoverer=fail_discovery,
     )
@@ -324,6 +347,7 @@ async def test_doris_count_honors_negotiated_daft_capability() -> None:
         database="analytics",
         table="events",
         transport="flight",
+        split="auto",
         _arrow_schema=SCHEMA,
         _tablet_discoverer=lambda sql, parameters: pytest.fail("count must not discover tablets"),
     )
@@ -340,3 +364,26 @@ async def test_doris_count_honors_negotiated_daft_capability() -> None:
     assert "count(*) AS `id`" in count_task._query.sql
     with pytest.raises(CompatibilityError):
         _ = [task async for task in source.get_tasks(Pushdowns(aggregation=daft.col("id").sum()))]
+
+
+@pytest.mark.asyncio
+async def test_doris_default_single_snapshots_nested_query_parameters() -> None:
+    ids = [1, 2]
+    source = DorisDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        transport="mysql",
+        unsafe_where_sql="id IN :ids",
+        query_parameters={"ids": ids},
+        _arrow_schema=SCHEMA,
+        _tablet_discoverer=lambda sql, parameters: pytest.fail(
+            "default single must not discover tablets"
+        ),
+    )
+    ids.append(3)
+
+    tasks = [cast(DorisTask, task) async for task in source.get_tasks(Pushdowns())]
+
+    assert len(tasks) == 1
+    assert tasks[0]._query.positional_parameters == ([1, 2],)

@@ -74,7 +74,7 @@ async def stream_query(
     failure: BaseException | None = None
     try:
         client = await _driver().get_async_client(**connection.client_kwargs(limits))
-        settings = dict(connection.settings)
+        settings = connection.settings_kwargs()
         settings["max_block_size"] = limits.batch_rows
         settings["max_execution_time"] = max(1, math.ceil(limits.query_timeout_seconds))
         context = await client.query_arrow_stream(

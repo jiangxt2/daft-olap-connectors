@@ -6,6 +6,13 @@ The driver discovers a canonical schema and safe split units. It creates immutab
 specifications containing a redacted connection configuration, transport-safe SQL, canonical Arrow
 schema, and partition or tablet identifiers. Live clients are never serialized.
 
+Before schema discovery, public query parameters and driver option mappings are copied through a
+standard-library pickle round trip. This preserves supported nested container and custom value
+types while severing caller-owned mutable references. Callables, cyclic containers, open runtime
+resources, and values that cannot be reconstructed fail with a redacted `ConfigurationError` on
+the driver. Private planner/task factories remain test seams and are not part of the public option
+serialization contract. Each driver invocation receives fresh nested client/MySQL option values.
+
 Network-backed split discovery is awaited from `get_tasks()` through a worker thread so synchronous
 ClickHouse metadata, PyMySQL binding, and Doris FE HTTP calls do not block Daft's async planning
 loop. Planning still completes before tasks are emitted and its latency remains part of DataSource
@@ -46,7 +53,10 @@ only positional parameter count, named parameter names, and Arrow schema.
 
 ## Splits
 
-ClickHouse splitting is available only for an explicitly allowlisted, non-replicated MergeTree
+Both connectors default to `split="single"`, so an omitted split produces one task without
+partition or tablet discovery. Parallel planning is an explicit `split="auto"` opt-in.
+
+ClickHouse automatic splitting is available only for an explicitly allowlisted, non-replicated MergeTree
 physical engine whose complete active parts are observable from one server. ReplicatedMergeTree,
 SharedMergeTree, Distributed tables, views, and unknown engines fail closed to one task. Active
 `system.parts.partition_id` values are weighted by bytes and grouped under `target_tasks` and
@@ -57,8 +67,8 @@ and every task query to that same physical server. The connector cannot detect a
 routes physical-table queries across servers; such endpoints must use `split="single"` or a
 server-pinned address. Replica-aware discovery is outside v1.
 
-Doris planning sends the projected, safely bound single-table SQL to FE `_query_plan`, validates the
-response, and consumes only unique positive tablet IDs. Task SQL uses `TABLET(...)`. The Base64
+Doris automatic planning sends the projected, safely bound single-table SQL to FE `_query_plan`,
+validates the response, and consumes only unique positive tablet IDs. Task SQL uses `TABLET(...)`. The Base64
 opaque plan is never executed because that would require an undocumented direct-BE scanner,
 authentication, topology, and lifecycle contract.
 

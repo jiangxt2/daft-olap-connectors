@@ -200,6 +200,23 @@ def test_clickhouse_query_parameters_require_unsafe_fragment() -> None:
         )
 
 
+def test_clickhouse_rejects_unserializable_parameters_before_schema_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "daft_olap.clickhouse.datasource.discover_schema",
+        lambda *args, **kwargs: pytest.fail("schema discovery must not run"),
+    )
+
+    with pytest.raises(ConfigurationError, match=r"query_parameters\['value'\].*function"):
+        ClickHouseDataSource(
+            host="localhost",
+            database="analytics",
+            table="events",
+            query_parameters={"value": lambda: None},
+        )
+
+
 @pytest.mark.asyncio
 async def test_clickhouse_datasource_plans_bounded_partition_tasks_and_hidden_filter_column() -> (
     None
@@ -224,6 +241,7 @@ async def test_clickhouse_datasource_plans_bounded_partition_tasks_and_hidden_fi
         database="analytics",
         table="events",
         password="secret-value",
+        split="auto",
         target_tasks=2,
         max_tasks=2,
         _arrow_schema=SCHEMA,
@@ -260,6 +278,7 @@ async def test_clickhouse_discovery_policy_warns_only_for_single_task_fallback(
         database="analytics",
         table="events",
         password=secret,
+        split="auto",
         _arrow_schema=SCHEMA,
         _partition_discoverer=fail_discovery,
     )
@@ -280,6 +299,7 @@ async def test_clickhouse_discovery_policy_warns_only_for_single_task_fallback(
         database="analytics",
         table="events",
         password=secret,
+        split="auto",
         discovery_policy="error",
         _arrow_schema=SCHEMA,
         _partition_discoverer=fail_discovery,
@@ -301,6 +321,7 @@ async def test_clickhouse_physical_partition_column_disables_virtual_partition_s
         host="localhost",
         database="analytics",
         table="events",
+        split="auto",
         _arrow_schema=schema,
         _partition_discoverer=lambda: pytest.fail("physical column must bypass discovery"),
     )
@@ -330,6 +351,7 @@ async def test_clickhouse_nonrecoverable_discovery_errors_never_fall_back(
         host="localhost",
         database="analytics",
         table="events",
+        split="auto",
         _arrow_schema=SCHEMA,
         _partition_discoverer=fail_discovery,
     )
@@ -375,6 +397,7 @@ async def test_clickhouse_count_honors_negotiated_daft_capability() -> None:
         host="localhost",
         database="analytics",
         table="events",
+        split="auto",
         _arrow_schema=SCHEMA,
         _partition_discoverer=lambda: pytest.fail("count must not discover partitions"),
     )
@@ -391,3 +414,23 @@ async def test_clickhouse_count_honors_negotiated_daft_capability() -> None:
     assert "count() AS `id`" in count_task._query.sql
     with pytest.raises(CompatibilityError):
         _ = [task async for task in source.get_tasks(Pushdowns(aggregation=daft.col("id").sum()))]
+
+
+@pytest.mark.asyncio
+async def test_clickhouse_default_single_snapshots_nested_query_parameters() -> None:
+    ids = [1, 2]
+    source = ClickHouseDataSource(
+        host="localhost",
+        database="analytics",
+        table="events",
+        unsafe_where_sql="id IN %(ids)s",
+        query_parameters={"ids": ids},
+        _arrow_schema=SCHEMA,
+        _partition_discoverer=lambda: pytest.fail("default single must not discover partitions"),
+    )
+    ids.append(3)
+
+    tasks = [cast(ClickHouseTask, task) async for task in source.get_tasks(Pushdowns())]
+
+    assert len(tasks) == 1
+    assert tasks[0]._query.named_parameter_dict() == {"ids": [1, 2]}

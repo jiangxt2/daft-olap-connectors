@@ -116,7 +116,7 @@ def _flight_port() -> int:
 def _source(
     *,
     transport: str = "mysql",
-    split: str = "auto",
+    split: str = "single",
     http_port: int | None = None,
     table: str = "events",
 ) -> DorisDataSource:
@@ -151,7 +151,6 @@ def test_projection_filter_limit_count_nulls_and_repeat_collect(transport: str) 
         transport=transport,
         columns=("id", "kind"),
         filter=daft.col("score") >= 25,
-        split="auto",
         batch_rows=2,
         target_tasks=4,
     ).sort("id")
@@ -380,6 +379,7 @@ async def test_query_plan_returns_tablets_and_strict_discovery_does_not_fallback
         database="analytics",
         table="events",
         transport="mysql",
+        split="auto",
     )
     with pytest.raises(DatabasePermissionError):
         _ = [task async for task in no_access.get_tasks(Pushdowns())]

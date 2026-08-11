@@ -49,11 +49,11 @@ events = read_clickhouse(
     password=SecretRef.env("CLICKHOUSE_PASSWORD"),
     filter=daft.col("event_date") >= "2026-01-01",
     columns=["event_id", "event_date", "amount"],
-    split="auto",
 )
 ```
 
-ClickHouse has one fixed transport: `clickhouse-connect` async Arrow streaming. Automatic splitting
+ClickHouse has one fixed transport: `clickhouse-connect` async Arrow streaming. One task and one
+database query is the default. Set `split="auto"` explicitly to opt into automatic splitting, which
 uses active `_partition_id` values only for an explicitly supported, non-replicated MergeTree-family
 physical table observed on one server. Replicated/Shared engines, views, Distributed tables,
 unknown engines, and unavailable metadata use one task. For `split="auto"`, the configured endpoint
@@ -82,13 +82,13 @@ events = read_doris(
     password=SecretRef.env("DORIS_PASSWORD"),
     filter=daft.col("score") >= 80,
     columns=["event_id", "score"],
-    split="auto",
 )
 ```
 
 Doris requires `transport="mysql"` or `transport="flight"` on every call. It never selects a
 protocol automatically and never retries through another protocol. Flight SQL is experimental.
-Automatic splitting asks FE's `_query_plan` endpoint for tablet IDs, then executes ordinary
+One task and one database query is the default. Set `split="auto"` explicitly to ask FE's
+`_query_plan` endpoint for tablet IDs and then execute ordinary
 `TABLET(...)` SQL through the selected transport. The opaque direct-BE plan is intentionally not
 executed. For encrypted endpoints, set `http_secure=True` with the FE HTTPS port and
 `flight_secure=True` with a TLS-enabled Flight endpoint; certificate options remain explicit in
@@ -114,6 +114,14 @@ clickhouse-connect performs Python-style formatting. Timezone-aware `datetime` a
 are rejected rather than silently losing or changing their timezone; normalize them explicitly to
 the database's intended wall-clock convention before creating a filter or query parameter.
 
+Caller-owned `query_parameters`, `settings`, `client_options`, `mysql_options`, and
+`flight_options` are snapshotted during DataSource construction. Nested containers are isolated
+from later caller mutation, and every value must pass the standard-library pickle contract used by
+worker task specifications. Callables, open files or sockets, live clients/cursors/readers,
+`SSLContext`, cyclic containers, and other non-serializable runtime objects fail with a redacted
+`ConfigurationError` before schema discovery. This serialization check does not imply that a
+database driver accepts every serializable value.
+
 ## Resource and consistency boundary
 
 Each transport pulls on demand and closes its resources after success, error, cancellation, or
@@ -130,9 +138,9 @@ unsupported complex or evolving types fail during schema discovery instead of be
 silently converted. See the
 [tested type matrix](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/compatibility.md#type-policy).
 
-Parallel tasks issue independent database queries and do not share a transaction snapshot. Use
-stable tables, database-side snapshots, or `split="single"` when a single-query visibility boundary
-is required. See the
+The default `split="single"` path uses one database query. Explicit `split="auto"` tasks issue
+independent queries and do not share a transaction snapshot. Use stable tables or a database-side
+snapshot when opting into parallel scans that require stronger consistency. See the
 [consistency contract](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/consistency.md)
 and [compatibility matrix](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/compatibility.md).
 Public failure categories, cancellation, timeout, and runtime wrapping are defined by the

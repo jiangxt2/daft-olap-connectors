@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import pickle
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, time
@@ -31,23 +32,130 @@ _MAX_TASKS = 1_024
 _MAX_TIMEOUT_SECONDS = 86_400
 
 
+def _snapshot_error(value: Any, *, value_path: str) -> ConfigurationError:
+    return ConfigurationError(
+        f"{value_path} value of type {type(value).__name__} must be safely serializable"
+    )
+
+
+def _validate_snapshot_structure(
+    value: Any,
+    *,
+    value_path: str,
+    active_containers: set[int],
+) -> None:
+    if callable(value):
+        raise _snapshot_error(value, value_path=value_path)
+    if not isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return
+
+    identity = id(value)
+    if identity in active_containers:
+        raise ConfigurationError(f"{value_path} contains a cycle")
+    active_containers.add(identity)
+    try:
+        if isinstance(value, Mapping):
+            for index, (key, nested) in enumerate(value.items()):
+                _validate_snapshot_structure(
+                    key,
+                    value_path=f"{value_path}.key[{index}]",
+                    active_containers=active_containers,
+                )
+                _validate_snapshot_structure(
+                    nested,
+                    value_path=f"{value_path}[{index}]",
+                    active_containers=active_containers,
+                )
+        else:
+            for index, nested in enumerate(value):
+                _validate_snapshot_structure(
+                    nested,
+                    value_path=f"{value_path}[{index}]",
+                    active_containers=active_containers,
+                )
+    finally:
+        active_containers.remove(identity)
+
+
+def snapshot_serializable(value: Any, *, value_path: str) -> Any:
+    """Return an independent pickle-round-tripped value or a redacted configuration error."""
+    try:
+        _validate_snapshot_structure(
+            value,
+            value_path=value_path,
+            active_containers=set(),
+        )
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        # The payload is created in-process above; external pickle bytes are never accepted.
+        snapshot: Any = pickle.loads(payload)  # noqa: S301
+    except ConfigurationError:
+        raise
+    except Exception:
+        raise _snapshot_error(value, value_path=value_path) from None
+    return snapshot
+
+
 def freeze_options(
-    options: dict[str, Any] | None,
+    options: Mapping[str, Any] | None,
     *,
     reserved: set[str],
     option_name: str,
 ) -> tuple[tuple[str, Any], ...]:
-    """Copy a mapping into a deterministic, serializable tuple and protect managed keys."""
+    """Snapshot a mapping into a deterministic tuple and protect managed keys."""
     if options is None:
         return ()
+    try:
+        items = tuple(options.items())
+    except Exception:
+        raise ConfigurationError(f"{option_name} must be a readable mapping") from None
     frozen: list[tuple[str, Any]] = []
-    for key, value in options.items():
+    for key, value in items:
         if not isinstance(key, str) or not key:
             raise ConfigurationError(f"{option_name} keys must be non-empty strings")
         if key in reserved:
             raise ConfigurationError(f"{option_name} must not override managed option {key!r}")
-        frozen.append((key, value))
+        frozen.append(
+            (
+                key,
+                snapshot_serializable(value, value_path=f"{option_name}[{key!r}]"),
+            )
+        )
     return tuple(sorted(frozen, key=lambda item: item[0]))
+
+
+def freeze_query_parameters(
+    parameters: Mapping[str, Any] | None,
+) -> tuple[tuple[str, Any], ...]:
+    """Snapshot named query parameters while preserving caller-specified order."""
+    if parameters is None:
+        return ()
+    try:
+        items = tuple(parameters.items())
+    except Exception:
+        raise ConfigurationError("query_parameters must be a readable mapping") from None
+    if any(not isinstance(key, str) or not key for key, _ in items):
+        raise ConfigurationError("query parameter names must be non-empty strings")
+    frozen = tuple(
+        (
+            key,
+            snapshot_serializable(value, value_path=f"query_parameters[{key!r}]"),
+        )
+        for key, value in items
+    )
+    validate_query_parameter_values(value for _, value in frozen)
+    return frozen
+
+
+def thaw_options(
+    options: tuple[tuple[str, Any], ...],
+    *,
+    option_name: str,
+) -> dict[str, Any]:
+    """Return fresh nested option values for one driver invocation."""
+    return {
+        key: snapshot_serializable(value, value_path=f"{option_name}[{key!r}]")
+        for key, value in options
+    }
 
 
 def validate_query_parameter_values(values: Iterable[Any]) -> None:
@@ -168,8 +276,21 @@ class QuerySpec:
             raise ConfigurationError("query SQL must not be empty")
         if self.positional_parameters and self.named_parameters:
             raise ConfigurationError("a query cannot mix positional and named parameters")
-        validate_query_parameter_values(iter(self.positional_parameters))
-        validate_query_parameter_values(iter(value for _, value in self.named_parameters))
+        positional_parameters = tuple(
+            snapshot_serializable(value, value_path=f"positional_parameters[{index}]")
+            for index, value in enumerate(self.positional_parameters)
+        )
+        named_parameters = tuple(
+            (
+                name,
+                snapshot_serializable(value, value_path=f"named_parameters[{index}]"),
+            )
+            for index, (name, value) in enumerate(self.named_parameters)
+        )
+        validate_query_parameter_values(iter(positional_parameters))
+        validate_query_parameter_values(iter(value for _, value in named_parameters))
+        object.__setattr__(self, "positional_parameters", positional_parameters)
+        object.__setattr__(self, "named_parameters", named_parameters)
 
     def named_parameter_dict(self) -> dict[str, Any]:
         """Return a fresh parameter mapping for a database driver."""

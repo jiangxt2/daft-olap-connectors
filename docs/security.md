@@ -14,6 +14,12 @@ Serialized `QuerySpec` values remain necessary for worker execution, but their r
 the complete SQL and every parameter value. Only parameter shape and the canonical Arrow schema are
 shown.
 
+Public query parameters and driver options are snapshotted and validated for standard-library
+pickle serialization before schema discovery. Rejection messages include only a safe option path
+and type; they never include the value, its representation, or third-party exception text. Open
+files, sockets, live clients/cursors/readers, `SSLContext`, callables, and cyclic containers are not
+accepted as configuration values. Private test factories are not serialized into worker tasks.
+
 Public exception categories and Daft/Ray wrapping behavior are specified in the
 [error contract](errors.md). Cancellation is preserved as `asyncio.CancelledError`; sanitized
 timeout failures never include driver URLs or parameter values.
