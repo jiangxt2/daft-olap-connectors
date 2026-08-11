@@ -25,6 +25,12 @@ For PyMySQL, 1.2.0 is the actually validated release. The allowed `>=1.2,<1.3` r
 not certify an untested future 1.2 patch; expanding to another minor line requires its own
 capability contract and real Doris lifecycle test.
 
+The release workflow reruns this fixed compatibility matrix against one validated, `master`-reachable
+candidate SHA. It does not reuse results from another commit. A manual release dry-run has the same
+matrix and real database gates but deterministically skips PyPI and GitHub Release jobs. A version
+is release evidence only after its own run completes; the declared dependency ranges remain resolver
+boundaries, not proof that every combination was exercised.
+
 The public `DataSource.supports_count_pushdown()` capability is present from Daft 0.7.22. This
 project keeps 0.7.23 as its minimum because that is the fully validated connector and Tributo
 combination baseline. The compatibility adapter still validates the exact native global-count
