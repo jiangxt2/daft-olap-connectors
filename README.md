@@ -128,15 +128,15 @@ Schema support is evidence-based. ClickHouse applies explicit canonical casts fo
 UUID, IP, Enum, and supported nested children. Decimal precision above 38, Doris LARGEINT, and
 unsupported complex or evolving types fail during schema discovery instead of being truncated or
 silently converted. See the
-[tested type matrix](https://github.com/jiangxt2/daft-olap-connectors/blob/main/docs/compatibility.md#type-policy).
+[tested type matrix](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/compatibility.md#type-policy).
 
 Parallel tasks issue independent database queries and do not share a transaction snapshot. Use
 stable tables, database-side snapshots, or `split="single"` when a single-query visibility boundary
 is required. See the
-[consistency contract](https://github.com/jiangxt2/daft-olap-connectors/blob/main/docs/consistency.md)
-and [compatibility matrix](https://github.com/jiangxt2/daft-olap-connectors/blob/main/docs/compatibility.md).
+[consistency contract](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/consistency.md)
+and [compatibility matrix](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/compatibility.md).
 Public failure categories, cancellation, timeout, and runtime wrapping are defined by the
-[error contract](https://github.com/jiangxt2/daft-olap-connectors/blob/main/docs/errors.md).
+[error contract](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/errors.md).
 
 ## Development
 
@@ -144,7 +144,7 @@ The repository uses Hatchling and uv. Unit, native, Ray, and real ClickHouse/Dor
 required; database behavior is never accepted from mocks alone. The Ray database tests also record
 each executed task and prove that ClickHouse partition and Doris tablet fan-out occurred, rather
 than accepting a single-task fallback that happens to return the same rows. See
-[CONTRIBUTING.md](https://github.com/jiangxt2/daft-olap-connectors/blob/main/CONTRIBUTING.md) and
-[the architecture](https://github.com/jiangxt2/daft-olap-connectors/blob/main/docs/architecture.md).
+[CONTRIBUTING.md](https://github.com/jiangxt2/daft-olap-connectors/blob/master/CONTRIBUTING.md) and
+[the architecture](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/architecture.md).
 
 Licensed under the Apache License, Version 2.0.
