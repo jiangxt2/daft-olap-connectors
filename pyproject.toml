@@ -119,7 +119,6 @@ ignore = ["PLR0913"]
 "src/daft_olap/doris/discovery.py" = ["PLC0415", "S310"]
 "src/daft_olap/doris/sql.py" = ["S608"]
 "src/daft_olap/doris/transports/flight.py" = ["PLC0415"]
-"scripts/check_dco.py" = ["S603", "S607"]
 "scripts/wait_for_service.py" = ["PLC0415", "S310"]
 "tests/**/*.py" = ["PLR2004", "S101", "S105", "S106", "S301", "S603"]
 

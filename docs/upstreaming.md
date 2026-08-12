@@ -10,6 +10,11 @@ external proposal should be a small documentation PR adding the package to Daft'
 Extensions page. The package must already have installation instructions, compatibility claims,
 governance files, and real-infrastructure test evidence before that proposal.
 
+Repository metadata, a merged release-readiness change, or a successful non-publishing dry-run is
+not a public release. The Community Extensions proposal starts only after the exact PyPI version,
+GitHub tag, release assets, distribution hashes, and release-run evidence have been verified. Its
+body and submission require their own review and authorization.
+
 Core contributions are limited by default to generic improvements that benefit all custom
 DataSources, such as a more stable capability API, documented task metadata, or bounded async bridge
 behavior. Each such change needs its own maintainer discussion and cannot be a runtime prerequisite

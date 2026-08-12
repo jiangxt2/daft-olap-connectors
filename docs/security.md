@@ -61,3 +61,27 @@ for Flight result endpoints, BE proxy addresses.
 Use the private process in the
 [security policy](https://github.com/jiangxt2/daft-olap-connectors/security/policy). Never include
 live secrets or production rows in a report.
+
+## Release supply chain
+
+Release candidates must be immutable commits reachable from protected `master`. Tag and manual
+dry-run modes execute the same static, compatibility, Ray, and real-database gates against that
+commit. Manual dry-runs never request write permissions and deterministically skip both publishing
+jobs. Tag mode accepts only a newly created, non-forced tag push whose event SHA still matches the
+fetched tag commit. The live remote tag and the complete distribution identity are revalidated
+immediately before PyPI and GitHub Release writes.
+
+Every third-party Action in the release execution chain is pinned to a full commit SHA with its
+verified upstream release tag documented beside the reference. TruffleHog scans the candidate SHA,
+and Anchore generates an SPDX JSON SBOM from the final distributions. The wheel and sdist are built
+once per run, recorded in `SHA256SUMS`, and downloaded by install, PyPI, and GitHub Release consumers
+instead of being rebuilt.
+
+PyPI publishing uses GitHub OIDC and a separately administered `pypi` environment; no long-lived
+package-index token belongs in the repository. That job receives `id-token: write` plus read-only
+repository contents for candidate and tag verification; only the later GitHub Release job receives
+`contents: write`. Initial Alpha publishing deliberately does not enable provenance attestations.
+An external tag ruleset must prevent release-tag update and deletion because a workflow lookup and
+an external publish cannot form one atomic operation. A digest and SBOM improve artifact
+traceability but do not replace source review, runtime tests, or independent verification of remote
+Trusted Publisher, environment, and tag-rule settings. See the [release procedure](releasing.md).

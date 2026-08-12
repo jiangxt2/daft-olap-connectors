@@ -18,4 +18,3 @@ Explain the user problem and why this design fits Daft's DataSource direction.
 - [ ] No credential appears in logs, exceptions, plans, or representations
 - [ ] Unsupported behavior fails closed or has a documented single-task fallback
 - [ ] New public behavior is documented in the compatibility matrix
-- [ ] Every commit contains a matching `Signed-off-by` trailer

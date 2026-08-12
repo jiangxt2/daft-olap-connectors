@@ -11,6 +11,10 @@ to remain independently installable and versioned. Upstream work is expected to 
 generic Daft API or runtime improvements; moving a database connector into Daft core would require
 an explicit maintainer invitation and a separate design review.
 
+The current source version is `0.1.0a1` and is intentionally classified as Alpha. Core Alpha scope
+is ClickHouse and Doris MySQL read support; Doris Flight SQL is experimental. Repository metadata
+does not by itself prove that a matching Git tag or PyPI release exists.
+
 ## Installation
 
 Install only the transports used by your workers:
@@ -20,6 +24,10 @@ pip install "daft-olap-connectors[clickhouse]"
 pip install "daft-olap-connectors[doris]"
 pip install "daft-olap-connectors[doris-flight]"
 ```
+
+For a published Alpha, include `--pre` and pin the exact reviewed version, for example
+`pip install --pre "daft-olap-connectors[clickhouse]==0.1.0a1"`. Verify that version exists on the
+package index before deployment; do not infer publication from this repository's version field.
 
 Ray workers need the same package version and extra as the driver.
 
@@ -162,5 +170,7 @@ each executed task and prove that ClickHouse partition and Doris tablet fan-out 
 than accepting a single-task fallback that happens to return the same rows. See
 [CONTRIBUTING.md](https://github.com/jiangxt2/daft-olap-connectors/blob/master/CONTRIBUTING.md) and
 [the architecture](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/architecture.md).
+The [release procedure](https://github.com/jiangxt2/daft-olap-connectors/blob/master/docs/releasing.md)
+keeps non-publishing candidate validation separate from tag, PyPI, and GitHub Release operations.
 
 Licensed under the Apache License, Version 2.0.

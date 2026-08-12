@@ -22,5 +22,6 @@ nav:
   - Consistency: consistency.md
   - Error contract: errors.md
   - Security: security.md
+  - Releasing: releasing.md
   - Community and upstream contributions: upstreaming.md
 strict: true
