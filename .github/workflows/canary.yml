@@ -32,7 +32,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: nightly-2025-09-03
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Daft Rust toolchain
         run: rustup toolchain install "${RUSTUP_TOOLCHAIN}" --profile minimal
       - uses: astral-sh/setup-uv@v6
